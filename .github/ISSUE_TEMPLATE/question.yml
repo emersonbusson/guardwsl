@@ -1,0 +1,33 @@
+name: Usage question
+description: Ask for help using or configuring GuardWSL.
+title: "question: "
+labels:
+  - question
+body:
+  - type: input
+    id: goal
+    attributes:
+      label: Goal
+      description: What are you trying to accomplish?
+    validations:
+      required: true
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What you tried
+      description: Include redacted commands and output. Do not include private paths, credentials, or source code.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Optional output from `guard doctor` or `guard status`.
+      render: shell
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I removed credentials, private source, personal data, usernames, and machine-specific paths.
+          required: true

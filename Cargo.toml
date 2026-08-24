@@ -1,0 +1,36 @@
+[package]
+name = "guardwsl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.0"
+description = "Host-aware disk pressure protection for WSL2"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/emersonbusson/guardwsl"
+homepage = "https://github.com/emersonbusson/guardwsl"
+readme = "README.md"
+keywords = ["wsl", "wsl2", "disk-space", "build", "cleanup"]
+categories = ["command-line-utilities", "development-tools", "filesystem"]
+publish = false
+
+[[bin]]
+name = "guard"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+dirs = "6"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
