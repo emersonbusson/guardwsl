@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a reproducible GuardWSL defect or unsafe refusal failure.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove private paths, credentials, source code, and personal data before submitting. Report security vulnerabilities privately through SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: GuardWSL version
+      description: Paste `guard --version` or the commit SHA.
+      placeholder: guardwsl 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Windows version, WSL version, and distribution name. Do not include usernames or private paths.
+      placeholder: Windows 11; WSL 2.x; Ubuntu 24.04
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest safe sequence that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Optional output from `guard doctor`, `guard status`, or `guard clean --dry-run` after redaction.
+      render: shell
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I removed credentials, private source, personal data, usernames, and machine-specific paths.
+          required: true
+        - label: This report does not describe an undisclosed security vulnerability.
+          required: true

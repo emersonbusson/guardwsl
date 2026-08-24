@@ -1,0 +1,14 @@
+/target/
+*.log
+*.tmp
+.guardwsl/
+.env
+.env.*
+!.env.example
+.direnv/
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+coverage/
