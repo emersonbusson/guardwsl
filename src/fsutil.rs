@@ -138,10 +138,20 @@ fn validate_private_file(file: &File, path: &Path) -> Result<()> {
 }
 
 pub fn default_state_dir() -> Result<PathBuf> {
-    let root = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))
-        .context("HOME/XDG_STATE_HOME is unavailable")?;
+    let root = match std::env::var_os("XDG_STATE_HOME") {
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                bail!("XDG_STATE_HOME must be absolute")
+            }
+            path
+        }
+        None => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .context("an absolute HOME or XDG_STATE_HOME is required")?
+            .join(".local/state"),
+    };
     Ok(root.join("guardwsl"))
 }
 

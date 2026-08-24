@@ -324,10 +324,13 @@ pub fn execute_cleanup(
 }
 
 fn add_global_caches(config: &GuardConfig, pressure: DiskPressure, plan: &mut CleanupPlan) {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    else {
         plan.skips.push(CleanupSkip {
             path: PathBuf::from("$HOME"),
-            reason: "HOME is unavailable".to_owned(),
+            reason: "an absolute HOME is unavailable".to_owned(),
         });
         return;
     };

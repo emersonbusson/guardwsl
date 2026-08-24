@@ -668,7 +668,9 @@ fn resolve_tool(tool: &OsStr) -> Result<PathBuf> {
 }
 
 fn resolve_version_manager_tool(tool: &OsStr) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())?;
     let mut roots = Vec::new();
     if let Some(nvm_bin) = std::env::var_os("NVM_BIN") {
         roots.push(PathBuf::from(nvm_bin));
