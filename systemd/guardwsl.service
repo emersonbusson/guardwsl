@@ -1,0 +1,16 @@
+[Unit]
+Description=GuardWSL disk guardian
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/guard monitor
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=15s
+NoNewPrivileges=true
+Nice=10
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=default.target

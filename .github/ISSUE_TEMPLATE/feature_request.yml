@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose a focused improvement that preserves GuardWSL safety boundaries.
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user-visible problem should GuardWSL solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful behavior, including commands or configuration when relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and scope
+      description: Explain how the proposal fails closed, avoids private assumptions, and stays within the documented architecture.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Boundary confirmation
+      options:
+        - label: The proposal does not require an unrelated repository or product-specific policy.
+          required: true
+        - label: The proposal does not require privileged host mutation, VHDX compaction, or Hyper-V control.
+          required: true
