@@ -783,16 +783,15 @@ fn unescape_mount_path(value: &str) -> String {
 fn path_is_in_use(candidate: &Path) -> Result<bool> {
     let proc = fs::read_dir("/proc")?;
     let current_uid = effective_uid();
+    let current_pid = std::process::id().to_string();
     for process in proc {
         let process = process?;
-        if !process
-            .file_name()
-            .to_string_lossy()
-            .bytes()
-            .all(|byte| byte.is_ascii_digit())
-        {
+        let pid_str = process.file_name();
+        let pid_bytes = pid_str.to_string_lossy();
+        if !pid_bytes.bytes().all(|byte| byte.is_ascii_digit()) {
             continue;
         }
+        let is_self = pid_bytes == current_pid.as_str();
         let metadata = match process.metadata() {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -808,7 +807,7 @@ fn path_is_in_use(candidate: &Path) -> Result<bool> {
                 Ok(path) if reference_hits(&path, candidate) => return Ok(true),
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied && !is_self => {
                     inspection_denied = true;
                 }
                 Err(_) => {}
@@ -819,13 +818,18 @@ fn path_is_in_use(candidate: &Path) -> Result<bool> {
             Ok(entries) => {
                 for fd in entries {
                     let Ok(fd) = fd else {
-                        inspection_denied = true;
+                        if !is_self {
+                            inspection_denied = true;
+                        }
                         continue;
                     };
                     match fs::read_link(fd.path()) {
                         Ok(path) if reference_hits(&path, candidate) => return Ok(true),
                         Ok(_) => {}
-                        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error)
+                            if error.kind() == io::ErrorKind::PermissionDenied && !is_self =>
+                        {
                             inspection_denied = true;
                         }
                         Err(_) => {}
@@ -833,7 +837,7 @@ fn path_is_in_use(candidate: &Path) -> Result<bool> {
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied && !is_self => {
                 inspection_denied = true;
             }
             Err(_) => {}
