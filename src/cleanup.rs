@@ -854,7 +854,10 @@ fn path_is_in_use(candidate: &Path) -> Result<bool> {
                 return Ok(true);
             }
         }
-        if inspection_denied && !is_inert_user_manager(&command_line) {
+        if inspection_denied
+            && !command_line.is_empty()
+            && !is_inert_user_manager(&command_line)
+        {
             return Ok(true);
         }
     }
@@ -866,12 +869,26 @@ fn is_inert_user_manager(command_line: &[u8]) -> bool {
         .split(|byte| *byte == 0)
         .filter(|argument| !argument.is_empty())
         .collect::<Vec<_>>();
-    matches!(
+    if matches!(
         arguments.as_slice(),
         [program, flag]
             if (*program == b"/usr/lib/systemd/systemd" || *program == b"/lib/systemd/systemd")
                 && *flag == b"--user"
     ) || matches!(arguments.as_slice(), [program] if *program == b"(sd-pam)")
+    {
+        return true;
+    }
+    if let Some(program) = arguments.first() {
+        let program_str = String::from_utf8_lossy(program);
+        if program_str.ends_with("/Runner.Listener")
+            || program_str.ends_with("/Runner.Worker")
+            || program_str == "Runner.Listener"
+            || program_str == "Runner.Worker"
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn reference_hits(reference: &Path, candidate: &Path) -> bool {
@@ -1164,6 +1181,10 @@ mod tests {
     fn only_inert_user_managers_may_be_inaccessible() {
         assert!(is_inert_user_manager(b"/usr/lib/systemd/systemd\0--user\0"));
         assert!(is_inert_user_manager(b"(sd-pam)\0"));
+        assert!(is_inert_user_manager(
+            b"/home/runner/runners/bin/Runner.Listener\0"
+        ));
+        assert!(is_inert_user_manager(b"Runner.Worker\0"));
         assert!(!is_inert_user_manager(b"codex\0build\0"));
     }
 
