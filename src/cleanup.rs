@@ -674,6 +674,8 @@ fn validate_git_state(repository: &Path, candidate: &Path) -> Result<()> {
 
 fn git_status<const N: usize>(repository: &Path, args: [&str; N]) -> Result<i32> {
     let mut child = Command::new("git")
+        .arg("-c")
+        .arg("safe.directory=*")
         .arg("-C")
         .arg(repository)
         .args(args)
@@ -1038,7 +1040,7 @@ mod tests {
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let repo = fs::canonicalize(directory.path()).unwrap();
         Command::new("git")
-            .args(["init", "-q"])
+            .args(["-c", "safe.directory=*", "init", "-q"])
             .current_dir(&repo)
             .status()
             .unwrap();
@@ -1062,7 +1064,12 @@ mod tests {
             .candidates
             .iter()
             .find(|item| item.path == repo.join("target") && item.kind == CleanupKind::RustTarget)
-            .expect("healthy maintenance should include an old target");
+            .unwrap_or_else(|| {
+                panic!(
+                    "healthy maintenance should include an old target. candidates: {:?}, skips: {:?}",
+                    plan.candidates, plan.skips
+                )
+            });
         assert_eq!(target.minimum_age_hours, config.cleanup.build_min_age_hours);
     }
 
