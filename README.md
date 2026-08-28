@@ -69,6 +69,7 @@ guard clean --dry-run
 ## Commands
 
 ```text
+guard doctor
 guard status
 guard clean --dry-run
 guard clean
