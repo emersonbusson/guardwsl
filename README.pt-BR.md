@@ -71,26 +71,31 @@ guard status
 guard clean --dry-run
 ```
 
-## Comandos
+## Comandos e configuração
+
+O uso cotidiano é automático. Os comandos existem para inspecionar, diagnosticar, configurar
+ou alternar políticas:
 
 ```text
-guard doctor
-guard status
-guard clean --dry-run
-guard clean
-guard admission status
-guard admission on
-guard admission off
-guard config show
-guard config init
-guard config validate
-guard history
-guard exec -- <comando> [argumentos...]
+guard doctor                           # Verifica interop com o host, volume e travas
+guard status                           # Inspeciona pressão de disco/RAM e estado do gate
+guard clean --dry-run                  # Simula a limpeza sem apagar nenhum arquivo
+guard clean                            # Executa limpeza segura restrita à allowlist sob demanda
+guard admission status                 # Exibe se a fila/serialização de builds está ativa
+guard admission off                    # Desativa a fila de builds (para builds paralelos não coordenados)
+guard admission on                     # Reativa a serialização de builds pesados
+guard config show                      # Exibe a configuração e limites ativos
+guard config init                      # Cria ou reinicia ~/.config/guardwsl/config.toml
+guard config validate                  # Valida a sintaxe e os limites da configuração
+guard history                          # Exibe o histórico de auditoria das limpezas
+guard exec -- <comando> [args...]      # Executa um comando sob medição e locks do Guard
 ```
 
-O uso cotidiano é automático. `guard admission off` desliga somente a
-serialização de builds pesados; o preflight de disco/RAM e a segurança da
-limpeza continuam ativos. Testes e checks permanecem diretos nos dois modos.
+### Notas importantes de configuração
+
+- **Gate de Builds Pesados (`guard admission off / on`):** `guard admission off` desativa a fila de build único. Use se preferir compilações concorrentes na sua máquina.
+- **Testes e Linters Sempre Diretos:** Comandos como `cargo test`, `npm test`, `pytest`, `cargo clippy`, `tsc`, `lint` e `fmt` são classificados como verificações e **nunca adquirem travas, não esperam em filas e nunca falham por controle de admissão** em nenhum modo.
+- **Limites Personalizados:** Ajuste pisos de disco, memória, raízes de escaneamento e caminhos protegidos em `~/.config/guardwsl/config.toml`. Consulte a [referência canônica de configuração](docs/CONFIGURATION.md) (em inglês).
 
 ## Escopo exato da limpeza
 

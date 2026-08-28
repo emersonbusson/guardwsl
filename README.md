@@ -66,29 +66,31 @@ guard status
 guard clean --dry-run
 ```
 
-## Commands
-
-```text
-guard doctor
-guard status
-guard clean --dry-run
-guard clean
-guard admission status
-guard admission on
-guard admission off
-guard config show
-guard config init
-guard config validate
-guard history
-guard exec -- <command> [arguments...]
-```
+## Commands and configuration
 
 Daily operation is automatic. Commands exist to inspect, diagnose, configure,
-or explicitly invoke policy.
+or explicitly toggle policies:
 
-`guard admission off` disables only heavy-build serialization. It does not
-disable the disk/RAM preflight or cleanup safety. Tests and checks remain direct
-in either mode.
+```text
+guard doctor                           # Check host interop, backing volume, and locks
+guard status                           # Inspect Windows disk/RAM pressure and gate state
+guard clean --dry-run                  # Simulate cleanup without deleting files
+guard clean                            # Run safe, allowlist-only cleanup on demand
+guard admission status                 # Show whether heavy-build serialization is active
+guard admission off                    # Disable heavy-build queuing (for uncoordinated parallel builds)
+guard admission on                     # Re-enable heavy-build serialization
+guard config show                      # Display active configuration and thresholds
+guard config init                      # Create or reset ~/.config/guardwsl/config.toml
+guard config validate                  # Validate configuration bounds and syntax
+guard history                          # View recent cleanup audit log entries
+guard exec -- <command> [args...]      # Run a command under Guard preflight and locks
+```
+
+### Key configuration notes
+
+- **Heavy-Build Gate (`guard admission off / on`):** `guard admission off` disables the single-build queue. Use it if you prefer uncoordinated builds on your machine.
+- **Tests & Linters Always Direct:** Commands such as `cargo test`, `npm test`, `pytest`, `cargo clippy`, `tsc`, `lint`, and `fmt` are classified as checks and **never acquire locks, wait in queues, or fail from admission controls** in any mode.
+- **Custom Thresholds:** Adjust disk minimums, memory floors, scan roots, and protected paths in `~/.config/guardwsl/config.toml`. See the complete [configuration reference](docs/CONFIGURATION.md).
 
 ## Exact cleanup scope
 
