@@ -993,6 +993,8 @@ mod tests {
     #[test]
     fn generic_output_names_are_never_candidates() {
         let directory = tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let root = fs::canonicalize(directory.path()).unwrap();
         for name in ["dist", "build", "out"] {
             fs::create_dir(root.join(name)).unwrap();
@@ -1013,6 +1015,8 @@ mod tests {
     #[test]
     fn preserved_quarantine_is_never_traversed() {
         let directory = tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let root = fs::canonicalize(directory.path()).unwrap();
         let quarantine = root.join(".guardwsl-trash-42-0-target");
         fs::create_dir_all(quarantine.join("target")).unwrap();
@@ -1025,6 +1029,8 @@ mod tests {
     #[test]
     fn healthy_maintenance_discovers_old_repository_artifacts() {
         let directory = tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let repo = fs::canonicalize(directory.path()).unwrap();
         Command::new("git")
             .args(["init", "-q"])
@@ -1057,6 +1063,8 @@ mod tests {
     #[test]
     fn dry_run_never_mutates_candidate() {
         let directory = tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.path().join("cache");
         fs::create_dir(&path).unwrap();
         #[cfg(target_os = "linux")]
@@ -1104,6 +1112,8 @@ mod tests {
     #[test]
     fn protected_symlink_is_compared_by_its_canonical_target() {
         let directory = tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let real = directory.path().join("real");
         let candidate = real.join("cache");
         fs::create_dir_all(&candidate).unwrap();
@@ -1124,6 +1134,8 @@ mod tests {
     #[test]
     fn inaccessible_protected_root_keeps_its_lexical_protection() {
         let directory = tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let protected = directory.path().join("protected");
         fs::create_dir(&protected).unwrap();
         #[cfg(target_os = "linux")]
@@ -1146,6 +1158,7 @@ mod tests {
     #[test]
     fn writable_candidate_root_fails_closed() {
         let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.path().join("cache");
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
@@ -1160,6 +1173,7 @@ mod tests {
     #[test]
     fn quarantine_rejects_identity_change_before_rename() {
         let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.path().join("cache");
         fs::create_dir(&path).unwrap();
         fs::write(path.join("artifact"), b"preserve").unwrap();
@@ -1182,6 +1196,7 @@ mod tests {
     #[test]
     fn purge_preserves_quarantine_when_identity_diverges() {
         let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let quarantine = directory.path().join(".guardwsl-trash-test");
         fs::create_dir(&quarantine).unwrap();
         fs::write(quarantine.join("artifact"), b"preserve").unwrap();
@@ -1203,6 +1218,7 @@ mod tests {
     #[test]
     fn quarantine_removes_only_the_expected_identity() {
         let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.path().join("cache");
         fs::create_dir(&path).unwrap();
         fs::write(path.join("artifact"), b"regenerable").unwrap();
