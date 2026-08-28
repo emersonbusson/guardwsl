@@ -1001,6 +1001,7 @@ mod tests {
             age(&root.join(name));
         }
         let mut config = GuardConfig::default();
+        config.cleanup.protected_paths.clear();
         config.cleanup.scan_roots = vec![root.clone()];
         let plan = plan_cleanup(&config, DiskPressure::Critical).unwrap();
         for name in ["dist", "build", "out"] {
@@ -1050,6 +1051,7 @@ mod tests {
         age(&repo.join("target/artifact"));
         age(&repo.join("target"));
         let mut config = GuardConfig::default();
+        config.cleanup.protected_paths.clear();
         config.cleanup.scan_roots = vec![repo.clone()];
         let plan = plan_cleanup(&config, DiskPressure::Healthy).unwrap();
         let target = plan
