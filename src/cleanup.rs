@@ -854,10 +854,7 @@ fn path_is_in_use(candidate: &Path) -> Result<bool> {
                 return Ok(true);
             }
         }
-        if inspection_denied
-            && !command_line.is_empty()
-            && !is_inert_user_manager(&command_line)
-        {
+        if inspection_denied && !command_line.is_empty() && !is_inert_user_manager(&command_line) {
             return Ok(true);
         }
     }
