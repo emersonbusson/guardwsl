@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build release binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package artifacts
+        run: |
+          tag_name="${GITHUB_REF_NAME:-v0.1.0}"
+          archive_name="guardwsl-${tag_name}-x86_64-unknown-linux-gnu"
+          staging_dir="dist/${archive_name}"
+          mkdir -p "${staging_dir}"
+          cp target/release/guard "${staging_dir}/guard"
+          cp README.md "${staging_dir}/README.md"
+          cp README.pt-BR.md "${staging_dir}/README.pt-BR.md"
+          cp LICENSE-APACHE "${staging_dir}/LICENSE-APACHE"
+          cp LICENSE-MIT "${staging_dir}/LICENSE-MIT"
+          tar -czf "${archive_name}.tar.gz" -C dist "${archive_name}"
+          sha256sum "${archive_name}.tar.gz" > "${archive_name}.tar.gz.sha256"
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag_name="${GITHUB_REF_NAME}"
+          if [[ -z "${tag_name}" || "${tag_name}" == "main" ]]; then
+            tag_name="v0.1.0-manual"
+          fi
+          gh release create "${tag_name}" \
+            guardwsl-*.tar.gz \
+            guardwsl-*.tar.gz.sha256 \
+            --title "GuardWSL ${tag_name}" \
+            --generate-notes
