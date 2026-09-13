@@ -91,7 +91,7 @@ pub struct AdmissionConfig {
 impl Default for AdmissionConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             build_wait_seconds: 4 * 60 * 60,
         }
     }

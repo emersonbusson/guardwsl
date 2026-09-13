@@ -46,8 +46,8 @@ immediately returns a physical byte to the host volume.
 
 - Invalid active configuration falls back to the last-known-good copy in
   degraded mode and blocks mutation.
-- Missing or stale host telemetry blocks managed heavy builds.
-- Cleanup cannot overlap a managed heavy build.
+- Missing or stale host telemetry never blocks development commands.
+- Cleanup is independently serialized and validates that candidate paths are not in use.
 - A replaced lock, state file, candidate, or quarantine identity is rejected.
 - Bounded scans and output limits prevent unbounded host-probe or audit reads.
 

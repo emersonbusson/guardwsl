@@ -28,11 +28,6 @@ done
   printf 'The real tool PATH is empty after removing GuardWSL shims.\n' >&2
   exit 1
 }
-runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-build_lock="$runtime_dir/guardwsl-build.lock"
-maintenance_lock="$runtime_dir/guardwsl-maintenance.lock"
-host_disk_floor_bytes=68719476736
-host_memory_floor_bytes=12884901888
 umask 077
 
 [[ -n "$distro_name" ]] || {
@@ -47,62 +42,6 @@ umask 077
   printf 'The WSL distribution name is unsafe for installation: %s\n' "$distro_name" >&2
   exit 1
 }
-[[ -d "$runtime_dir" && ! -L "$runtime_dir" ]] || {
-  printf 'Invalid runtime directory: %s\n' "$runtime_dir" >&2
-  exit 1
-}
-for lock_path in "$build_lock" "$maintenance_lock"; do
-  [[ ! -L "$lock_path" ]] || {
-    printf 'A lock cannot be a symlink: %s\n' "$lock_path" >&2
-    exit 1
-  }
-done
-
-sample_host() {
-  local forwarded_wslenv="${WSLENV:-}"
-  local -a host_sample=()
-  if ! printf '%s\n' "$forwarded_wslenv" | tr ':' '\n' | cut -d/ -f1 | grep -Fxq GUARDWSL_DISTRO; then
-    forwarded_wslenv="${forwarded_wslenv:+$forwarded_wslenv:}GUARDWSL_DISTRO"
-  fi
-  local powershell_bin="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
-  [[ -x "$powershell_bin" ]] || powershell_bin="powershell.exe"
-  mapfile -t host_sample < <(
-    GUARDWSL_DISTRO="$distro_name" WSLENV="$forwarded_wslenv" \
-      "$powershell_bin" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '
-$ErrorActionPreference = "Stop"
-$distro = $env:GUARDWSL_DISTRO
-$match = @(Get-ChildItem -LiteralPath "HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss" | ForEach-Object {
-  $item = Get-ItemProperty -LiteralPath $_.PSPath
-  if ($item.DistributionName -eq $distro) { $item }
-})
-if ($match.Count -ne 1) { throw "distribution was not found exactly once" }
-$vhdx = Join-Path ([Environment]::ExpandEnvironmentVariables([string]$match[0].BasePath)) "ext4.vhdx"
-try {
-  $volume = Get-Volume -FilePath $vhdx -ErrorAction Stop
-  $free = [uint64]$volume.SizeRemaining
-} catch {
-  $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($vhdx))
-  $free = [uint64]$drive.AvailableFreeSpace
-}
-$os = Get-CimInstance Win32_OperatingSystem
-[Console]::WriteLine($free)
-[Console]::WriteLine([uint64]$os.FreePhysicalMemory * 1024)
-' | tr -d '\000\r'
-  )
-  [[ "${host_sample[0]:-}" =~ ^[0-9]+$ && "${host_sample[1]:-}" =~ ^[0-9]+$ ]] || {
-    printf 'Could not measure physical Windows disk and RAM.\n' >&2
-    return 1
-  }
-  if (( host_sample[0] < host_disk_floor_bytes )); then
-    printf 'Installation build blocked: the WSL backing volume has less than 64 GiB free.\n' >&2
-    return 75
-  fi
-  if (( host_sample[1] < host_memory_floor_bytes )); then
-    printf 'Installation build blocked: Windows has less than 12 GiB of available RAM.\n' >&2
-    return 75
-  fi
-}
-
 for managed_path in "$guard_bin" "$unit_path" "$config_path" "$config_lkg_path" "$shim_dir" "$distro_path" "$environment_path"; do
   if [[ -L "$managed_path" ]]; then
     printf 'A managed path cannot be a symlink: %s\n' "$managed_path" >&2
@@ -195,27 +134,10 @@ trap 'rollback; exit 130' INT TERM
 
 cd "$repo_dir"
 PATH="$real_tool_path" "$cargo_bin" test --locked
-exec {build_lock_fd}>"$build_lock"
-chmod 0600 "$build_lock"
-if ! flock -w 14400 "$build_lock_fd"; then
-  printf 'Installation build blocked: another heavy build is still active.\n' >&2
-  exit 75
-fi
-exec {maintenance_lock_fd}>"$maintenance_lock"
-chmod 0600 "$maintenance_lock"
-if ! flock -s -w 14400 "$maintenance_lock_fd"; then
-  printf 'Installation build blocked: cleanup is still active.\n' >&2
-  exit 75
-fi
-sample_host
 if [[ "$old_active" == "active" ]]; then
   systemctl --user stop guardwsl.service
 fi
 PATH="$real_tool_path" "$cargo_bin" build --release --locked
-flock -u "$maintenance_lock_fd"
-exec {maintenance_lock_fd}>&-
-flock -u "$build_lock_fd"
-exec {build_lock_fd}>&-
 
 install -m 0755 "$repo_dir/target/release/guard" "$guard_bin"
 install -m 0644 "$repo_dir/systemd/guardwsl.service" "$unit_path"
