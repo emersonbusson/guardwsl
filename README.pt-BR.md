@@ -29,8 +29,7 @@ ativar limpeza real em qualquer máquina.
 3. Uma allowlist exata permite limpar somente caches e artefatos conhecidos
    após validar proprietário, Git, idade, mount, tipo, hard links, uso por
    processo e identidade.
-4. Shims cooperativos serializam builds pesados reconhecidos. Testes, lint,
-   typecheck, checks, e2e e instalações sempre executam diretamente.
+4. Shims e `guard exec` encaminham builds e demais comandos diretamente.
 5. Toda intenção e resultado de limpeza entra em um log JSONL privado.
 
 GuardWSL **não** executa serviço Windows, controla Hyper-V, compacta ou converte
@@ -89,9 +88,8 @@ guard exec -- <comando> [args...]      # Encaminha um comando diretamente
 
 ### Notas importantes de configuração
 
-- **Gate de Builds Pesados (`guard admission off / on`):** `guard admission off` desativa a fila de build único. Use se preferir compilações concorrentes na sua máquina.
-- **Testes e Linters Sempre Diretos:** Comandos como `cargo test`, `npm test`, `pytest`, `cargo clippy`, `tsc`, `lint` e `fmt` são classificados como verificações e **nunca adquirem travas, não esperam em filas e nunca falham por controle de admissão** em nenhum modo.
-- **Limites Personalizados:** Ajuste pisos de disco, memória, raízes de escaneamento e caminhos protegidos em `~/.config/guardwsl/config.toml`. Consulte a [referência canônica de configuração](docs/CONFIGURATION.md) (em inglês).
+- **Comandos de desenvolvimento:** shims e `guard exec` nunca adquirem locks nem rejeitam comandos por RAM/disco.
+- **Limites personalizados:** ajuste pressão de disco, raízes e caminhos protegidos em `~/.config/guardwsl/config.toml`.
 
 ## Escopo exato da limpeza
 
