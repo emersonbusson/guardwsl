@@ -4,8 +4,7 @@
 
 - WSL2 with systemd enabled;
 - Windows PowerShell interoperability from WSL;
-- Rust 1.98.0, Cargo, Bash, and `flock`;
-- enough physical disk and host RAM for the installation build.
+- Rust 1.98.0, Cargo, and Bash.
 
 Review `scripts/install-linux.sh` before running it. The installer is
 user-scoped and does not require a Windows service or a root daemon.
@@ -22,10 +21,8 @@ The installer:
 
 1. backs up every managed user file;
 2. runs the Rust tests with GuardWSL shims removed from `PATH`;
-3. acquires the same build and maintenance locks used at runtime;
-4. probes physical Windows disk and RAM headroom;
-5. builds and installs `~/.local/bin/guard`;
-6. installs the systemd user unit and tool shims;
+3. builds and installs `~/.local/bin/guard`;
+4. installs the systemd user unit and tool shims;
 7. initializes or strictly normalizes the private configuration;
 8. enables the monitor and waits for `guard doctor` to become healthy;
 9. rolls back all managed files if any activation step fails.

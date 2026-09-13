@@ -1,21 +1,17 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
-use guardwsl::admission::{AdmissionClass, CommandIntent};
-use guardwsl::build_gate::{BuildGate, GateState};
 use guardwsl::cleanup::{CleanupMode, CleanupReport, execute_cleanup, plan_cleanup};
 use guardwsl::config::{ConfigStore, GuardConfig};
 use guardwsl::fsutil::{atomic_write_private, default_state_dir, ensure_private_dir, read_private};
 use guardwsl::history::AuditLog;
-use guardwsl::host::{
-    DiskPressure, HostSnapshot, PowerShellHostProbe, classify_disk, ensure_build_headroom,
-};
+use guardwsl::host::{DiskPressure, HostSnapshot, PowerShellHostProbe, classify_disk};
 use guardwsl::maintenance_lock::MaintenanceLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitStatus};
 use std::thread;
@@ -38,11 +34,6 @@ enum Command {
     Status(OutputArgs),
     /// Removes only revalidated, regenerable caches and artifacts.
     Clean(CleanArgs),
-    /// Enables, disables, or shows the heavy-build gate.
-    Admission {
-        #[command(subcommand)]
-        command: AdmissionCommand,
-    },
     /// Shows, initializes, or validates configuration.
     Config {
         #[command(subcommand)]
@@ -74,13 +65,6 @@ struct CleanArgs {
     dry_run: bool,
     #[arg(long)]
     json: bool,
-}
-
-#[derive(Debug, Subcommand)]
-enum AdmissionCommand {
-    On,
-    Off,
-    Status(OutputArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -134,7 +118,6 @@ fn run() -> Result<i32> {
     match Cli::parse().command {
         Command::Status(args) => status(args),
         Command::Clean(args) => clean(args),
-        Command::Admission { command } => admission(command),
         Command::Config { command } => config(command),
         Command::Exec(args) => execute_vector(args.command),
         Command::Doctor(args) => doctor(args),
@@ -151,9 +134,6 @@ fn status(args: OutputArgs) -> Result<i32> {
         .as_ref()
         .map(|loaded| loaded.config.clone())
         .unwrap_or_default();
-    let gate = BuildGate::for_current_user()
-        .and_then(|gate| gate.state())
-        .map(|state| state_name(state).to_owned());
     let host = probe_host(&config);
     let monitor = read_monitor_status(&config);
     let last_cleanup = read_cleanup_cycle();
@@ -167,13 +147,6 @@ fn status(args: OutputArgs) -> Result<i32> {
         .as_ref()
         .ok()
         .map(|snapshot| classify_disk(snapshot.volume_free_bytes, &config.disk));
-    let build_preflight = match &host {
-        Ok(snapshot) => match ensure_build_headroom(snapshot, &config) {
-            Ok(()) => json!({"ok": true, "error": null}),
-            Err(error) => json!({"ok": false, "error": error.to_string()}),
-        },
-        Err(error) => json!({"ok": false, "error": error.to_string()}),
-    };
     let report = json!({
         "service": "guardwsl",
         "version": env!("CARGO_PKG_VERSION"),
@@ -181,20 +154,12 @@ fn status(args: OutputArgs) -> Result<i32> {
             "ok": loaded.is_ok(),
             "origin": loaded.as_ref().ok().map(|value| value.origin),
             "degraded": loaded.as_ref().ok().is_some_and(|value| value.degraded),
-            "admission_enabled": config.admission.enabled,
             "cleanup_enabled": config.cleanup.enabled,
             "error": loaded.as_ref().err().map(ToString::to_string),
-        },
-        "admission": {
-            "configured_enabled": config.admission.enabled,
-            "effective_reachable": gate.is_ok(),
-            "gate_state": gate.as_ref().ok(),
-            "error": gate.as_ref().err().map(ToString::to_string),
         },
         "host": host.as_ref().ok(),
         "host_error": host.as_ref().err().map(ToString::to_string),
         "pressure": pressure.map(DiskPressure::as_str),
-        "heavy_build_preflight": build_preflight,
         "monitor": monitor_report,
         "cleanup_policy": {
             "enabled": config.cleanup.enabled,
@@ -217,7 +182,6 @@ fn status(args: OutputArgs) -> Result<i32> {
             ],
         },
         "last_cleanup": last_cleanup,
-        "disk_protection_independent_from_admission": true,
     });
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -226,7 +190,6 @@ fn status(args: OutputArgs) -> Result<i32> {
     }
     let healthy = loaded.as_ref().is_ok_and(|value| !value.degraded)
         && host.is_ok()
-        && gate.is_ok()
         && monitor
             .as_ref()
             .is_some_and(|status| status.healthy(&config));
@@ -236,22 +199,14 @@ fn status(args: OutputArgs) -> Result<i32> {
 fn print_status(report: &Value) {
     let configured = &report["configured"];
     println!(
-        "Guard: config={} | admission={} | gate={}",
+        "Guard: config={}",
         if configured["ok"].as_bool() == Some(true)
             && configured["degraded"].as_bool() != Some(true)
         {
             "ok"
         } else {
             "failed"
-        },
-        if configured["admission_enabled"].as_bool() == Some(true) {
-            "enabled"
-        } else {
-            "disabled"
-        },
-        report["admission"]["gate_state"]
-            .as_str()
-            .unwrap_or("unavailable")
+        }
     );
     if let Some(host) = report["host"].as_object() {
         println!(
@@ -276,16 +231,6 @@ fn print_status(report: &Value) {
                 "no - deletion frees ext4 space but does not shrink the physical file"
             }
         );
-        if report["heavy_build_preflight"]["ok"].as_bool() == Some(true) {
-            println!("New heavy build: allowed by the current preflight");
-        } else {
-            println!(
-                "New heavy build: blocked ({})",
-                report["heavy_build_preflight"]["error"]
-                    .as_str()
-                    .unwrap_or("telemetry unavailable")
-            );
-        }
     } else {
         println!(
             "Host: unavailable ({})",
@@ -485,62 +430,6 @@ fn read_cleanup_cycle() -> Option<CleanupCycle> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn admission(command: AdmissionCommand) -> Result<i32> {
-    let store = ConfigStore::discover()?;
-    match command {
-        AdmissionCommand::On => {
-            let loaded = store.set_admission_enabled(true)?;
-            println!(
-                "Admission enabled; cleanup remains {}.",
-                if loaded.config.cleanup.enabled {
-                    "enabled"
-                } else {
-                    "disabled by configuration"
-                }
-            );
-        }
-        AdmissionCommand::Off => {
-            let loaded = store.set_admission_enabled(false)?;
-            println!(
-                "Admission disabled; cleanup remains {}.",
-                if loaded.config.cleanup.enabled {
-                    "enabled"
-                } else {
-                    "disabled by configuration"
-                }
-            );
-        }
-        AdmissionCommand::Status(args) => {
-            let loaded = store.load_read_only()?;
-            let gate = BuildGate::for_current_user()?.state()?;
-            let report = json!({
-                "configured_enabled": loaded.config.admission.enabled,
-                "effective_reachable": true,
-                "gate_state": state_name(gate),
-                "heavy_builds": "exclusive_wait",
-                "tests_and_checks": "direct_not_gated",
-                "installs": "direct_not_gated",
-                "cleanup_independent": true,
-            });
-            if args.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                println!(
-                    "Admission: {} | gate: {} | tests/checks: direct and never gated",
-                    if loaded.config.admission.enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    },
-                    state_name(gate)
-                );
-                println!("Cleanup: independent from admission.");
-            }
-        }
-    }
-    Ok(0)
-}
-
 fn config(command: ConfigCommand) -> Result<i32> {
     let store = ConfigStore::discover()?;
     match command {
@@ -591,42 +480,8 @@ fn execute_vector(command: Vec<OsString>) -> Result<i32> {
 }
 
 fn execute_tool(tool: OsString, args: Vec<OsString>) -> Result<i32> {
-    let intent = CommandIntent::classify(&tool, &args);
     let executable = resolve_tool(&tool)?;
-    if intent.class != AdmissionClass::HeavyBuild {
-        return run_child(&executable, &args, None, false);
-    }
-    if inherited_heavy_permit() {
-        return run_child(&executable, &args, None, false);
-    }
-    let loaded = ConfigStore::discover()?.load_read_only()?;
-    if loaded.degraded {
-        bail!("configuration is degraded; protected execution is blocked")
-    }
-    let gate = loaded
-        .config
-        .admission
-        .enabled
-        .then(BuildGate::for_current_user)
-        .transpose()?;
-    match intent.class {
-        AdmissionClass::HeavyBuild => {
-            let wait = Duration::from_secs(loaded.config.admission.build_wait_seconds);
-            let _guard = match &gate {
-                Some(gate) => Some(gate.acquire_heavy(wait)?),
-                None => None,
-            };
-            let _maintenance = MaintenanceLock::acquire_shared(wait)?;
-            let snapshot = probe_host(&loaded.config)?;
-            ensure_build_headroom(&snapshot, &loaded.config)?;
-            let scratch = BuildScratch::new()?;
-            let _marker = ActiveBuildMarker::create(&intent, &snapshot)?;
-            run_child(&executable, &args, Some(&scratch.path), true)
-        }
-        AdmissionClass::TestOrCheck | AdmissionClass::Install | AdmissionClass::Other => {
-            unreachable!("only heavy builds reach configuration and the gate")
-        }
-    }
+    run_child(&executable, &args)
 }
 
 fn resolve_tool(tool: &OsStr) -> Result<PathBuf> {
@@ -704,75 +559,13 @@ fn resolve_version_manager_tool(tool: &OsStr) -> Option<PathBuf> {
     None
 }
 
-fn run_child(
-    executable: &Path,
-    args: &[OsString],
-    scratch: Option<&Path>,
-    mark_heavy_permit: bool,
-) -> Result<i32> {
+fn run_child(executable: &Path, args: &[OsString]) -> Result<i32> {
     let mut command = ProcessCommand::new(executable);
     command.args(args);
-    if mark_heavy_permit {
-        command.env("GUARDWSL_HEAVY_ROOT_PID", std::process::id().to_string());
-    }
-    if let Some(scratch) = scratch {
-        command
-            .env("TMPDIR", scratch)
-            .env("TMP", scratch)
-            .env("TEMP", scratch)
-            .env("GUARDWSL_BUILD_SCRATCH", scratch);
-    }
     let status = command
         .status()
         .with_context(|| format!("failed to start {}", executable.display()))?;
     Ok(exit_code(status))
-}
-
-fn inherited_heavy_permit() -> bool {
-    let Some(root_pid) = std::env::var_os("GUARDWSL_HEAVY_ROOT_PID")
-        .and_then(|value| value.to_str().and_then(|value| value.parse::<u32>().ok()))
-    else {
-        return false;
-    };
-    if root_pid == std::process::id() || !process_has_ancestor(root_pid) {
-        return false;
-    }
-    let Ok(path) = default_state_dir().map(|root| active_build_marker_path(&root, root_pid)) else {
-        return false;
-    };
-    let Ok(bytes) = read_private(&path, 256 * 1024) else {
-        return false;
-    };
-    serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .and_then(|value| value["pid"].as_u64())
-        == Some(u64::from(root_pid))
-}
-
-fn process_has_ancestor(expected: u32) -> bool {
-    let mut current = std::process::id();
-    for _ in 0..256 {
-        let Ok(stat) = fs::read(format!("/proc/{current}/stat")) else {
-            return false;
-        };
-        let Some(parent) = parent_pid_from_stat(&stat) else {
-            return false;
-        };
-        if parent == expected {
-            return true;
-        }
-        if parent <= 1 || parent == current {
-            return false;
-        }
-        current = parent;
-    }
-    false
-}
-
-fn parent_pid_from_stat(stat: &[u8]) -> Option<u32> {
-    let stat = std::str::from_utf8(stat).ok()?;
-    let after_name = stat.rsplit_once(") ")?.1;
-    after_name.split_whitespace().nth(1)?.parse().ok()
 }
 
 fn exit_code(status: ExitStatus) -> i32 {
@@ -781,77 +574,6 @@ fn exit_code(status: ExitStatus) -> i32 {
     }
     use std::os::unix::process::ExitStatusExt;
     status.signal().map_or(1, |signal| 128 + signal)
-}
-
-struct BuildScratch {
-    path: PathBuf,
-}
-
-impl BuildScratch {
-    fn new() -> Result<Self> {
-        let runtime = runtime_dir()?;
-        let path = runtime.join(format!("guardwsl-job-{}", std::process::id()));
-        if let Ok(metadata) = fs::symlink_metadata(&path) {
-            if metadata.file_type().is_symlink()
-                || !metadata.is_dir()
-                || metadata.uid() != effective_uid()
-            {
-                bail!("existing scratch directory has an unsafe identity")
-            }
-            fs::remove_dir_all(&path)?;
-        }
-        fs::create_dir(&path)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-        Ok(Self { path })
-    }
-}
-
-impl Drop for BuildScratch {
-    fn drop(&mut self) {
-        if let Ok(metadata) = fs::symlink_metadata(&self.path)
-            && metadata.is_dir()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == effective_uid()
-        {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-}
-
-struct ActiveBuildMarker {
-    path: PathBuf,
-}
-
-impl ActiveBuildMarker {
-    fn create(intent: &CommandIntent, snapshot: &HostSnapshot) -> Result<Self> {
-        let path = active_build_marker_path(&default_state_dir()?, std::process::id());
-        atomic_write_private(
-            &path,
-            &serde_json::to_vec_pretty(&json!({
-                "pid": std::process::id(),
-                "started_at": Utc::now(),
-                "intent": intent,
-                "host_at_admission": snapshot,
-            }))?,
-        )?;
-        Ok(Self { path })
-    }
-}
-
-fn active_build_marker_path(state_root: &Path, pid: u32) -> PathBuf {
-    state_root.join(format!("active-build-{pid}.json"))
-}
-
-impl Drop for ActiveBuildMarker {
-    fn drop(&mut self) {
-        if let Ok(metadata) = fs::symlink_metadata(&self.path)
-            && metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == effective_uid()
-        {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
 }
 
 fn history(args: HistoryArgs) -> Result<i32> {
@@ -890,12 +612,6 @@ fn doctor(args: OutputArgs) -> Result<i32> {
         .as_ref()
         .map(|loaded| loaded.config.clone())
         .unwrap_or_default();
-    match BuildGate::for_current_user().and_then(|gate| gate.state()) {
-        Ok(state) => checks.push(json!({"name":"build_gate","ok":true,"detail":state_name(state)})),
-        Err(error) => {
-            checks.push(json!({"name":"build_gate","ok":false,"detail":error.to_string()}))
-        }
-    }
     match probe_host(&config) {
         Ok(snapshot) => checks.push(json!({
             "name":"host_probe",
@@ -1111,13 +827,6 @@ fn pid_alive(pid: u32) -> bool {
     PathBuf::from("/proc").join(pid.to_string()).exists()
 }
 
-fn state_name(state: GateState) -> &'static str {
-    match state {
-        GateState::Idle => "idle",
-        GateState::HeavyBuildActive => "build_active",
-    }
-}
-
 fn pressure_cleanup_cooldown(pressure: DiskPressure) -> Duration {
     Duration::from_secs(match pressure {
         DiskPressure::Healthy => 15 * 60,
@@ -1153,13 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_state_names_are_stable_for_status_and_scripts() {
-        assert_eq!(state_name(GateState::Idle), "idle");
-        assert_eq!(state_name(GateState::HeavyBuildActive), "build_active");
-    }
-
-    #[test]
-    fn disabled_admission_does_not_imply_disabled_cleanup() {
+    fn disabled_build_admission_does_not_imply_disabled_cleanup() {
         let mut config = GuardConfig::default();
         config.admission.enabled = false;
         assert!(config.cleanup.enabled);
@@ -1171,14 +874,5 @@ mod tests {
             serde_json::to_value(ConfigOrigin::Default).unwrap(),
             json!("default")
         );
-    }
-
-    #[test]
-    fn proc_stat_parent_parser_uses_the_field_after_the_last_name_parenthesis() {
-        assert_eq!(
-            parent_pid_from_stat(b"123 (worker ) name) S 42 1 2 3"),
-            Some(42)
-        );
-        assert_eq!(parent_pid_from_stat(b"invalid"), None);
     }
 }

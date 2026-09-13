@@ -8,7 +8,7 @@ Idioma: [English](README.md)
 GuardWSL é uma ferramenta pequena e restrita ao usuário para proteger máquinas
 de desenvolvimento com WSL2. Ela observa o volume físico do Windows que contém
 a distribuição atual, remove somente artefatos comprovadamente regeneráveis e
-impede que builds pesados reconhecidos comecem ao mesmo tempo.
+não controla comandos de desenvolvimento.
 
 O desenho é deliberadamente conservador: na dúvida, os dados são preservados.
 
@@ -47,8 +47,7 @@ Requisitos:
 
 - WSL2 com systemd habilitado;
 - interoperabilidade com Windows PowerShell;
-- Rust 1.98.0, Cargo, Bash e `flock`;
-- disco e RAM físicos suficientes para o build de instalação.
+- Rust 1.98.0, Cargo e Bash.
 
 Revise o instalador antes de executá-lo:
 
@@ -77,18 +76,15 @@ O uso cotidiano é automático. Os comandos existem para inspecionar, diagnostic
 ou alternar políticas:
 
 ```text
-guard doctor                           # Verifica interop com o host, volume e travas
-guard status                           # Inspeciona pressão de disco/RAM e estado do gate
+guard doctor                           # Verifica interop com o host e volume
+guard status                           # Inspeciona pressão de disco/RAM
 guard clean --dry-run                  # Simula a limpeza sem apagar nenhum arquivo
 guard clean                            # Executa limpeza segura restrita à allowlist sob demanda
-guard admission status                 # Exibe se a fila/serialização de builds está ativa
-guard admission off                    # Desativa a fila de builds (para builds paralelos não coordenados)
-guard admission on                     # Reativa a serialização de builds pesados
 guard config show                      # Exibe a configuração e limites ativos
 guard config init                      # Cria ou reinicia ~/.config/guardwsl/config.toml
 guard config validate                  # Valida a sintaxe e os limites da configuração
 guard history                          # Exibe o histórico de auditoria das limpezas
-guard exec -- <comando> [args...]      # Executa um comando sob medição e locks do Guard
+guard exec -- <comando> [args...]      # Encaminha um comando diretamente
 ```
 
 ### Notas importantes de configuração
@@ -118,17 +114,10 @@ de credenciais e controle, como `.ssh`, `.gnupg`, `.config`, `.aws`, `.azure`,
 
 Leia o [modelo de segurança](docs/SAFETY.md) antes de ativar limpeza real.
 
-## Coordenação de builds pesados
+## Comandos de desenvolvimento
 
-O preflight padrão exige 64 GiB livres no volume físico do WSL e 12 GiB de RAM
-física disponível no Windows: piso de 8 GiB para o host e 4 GiB adicionais para
-o build. Os valores ficam em `~/.config/guardwsl/config.toml`; consulte a
-[referência canônica de configuração](docs/CONFIGURATION.md), em inglês.
-
-O gate é cooperativo. Os pontos de entrada normais são cobertos pelos shims, mas
-um caminho executável absoluto fora deles pode contornar o Guard. O kernel
-libera os locks quando os processos terminam; não existe fila distribuída ou
-serviço de leases.
+O GuardWSL observa disco e RAM apenas para status e decisões de limpeza. Builds e
+demais comandos são encaminhados diretamente, sem fila, lock ou preflight.
 
 ## Disco físico e VHDX sparse
 

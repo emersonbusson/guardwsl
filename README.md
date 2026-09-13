@@ -4,8 +4,8 @@ Language: [Portuguese (Brazil)](README.pt-BR.md)
 
 GuardWSL is a small, user-scoped safety tool for WSL2 development machines. It
 observes the physical Windows volume that backs the current distribution,
-removes only proven regenerable artifacts, and prevents recognized heavy builds
-from starting at the same time.
+removes only proven regenerable artifacts, and never controls development
+commands.
 
 The design is deliberately conservative: uncertainty preserves data.
 
@@ -19,14 +19,13 @@ real cleanup on any machine.
 ## What v1 does
 
 1. `guard status` reports physical host disk, physical Windows RAM, the current
-   WSL VHDX location and sparse attribute, monitor health, and build-gate state.
+   WSL VHDX location and sparse attribute, and monitor health.
 2. A systemd user monitor performs age-based maintenance and reacts to physical
    host-volume pressure.
 3. An exact allowlist permits cleanup of known caches and build artifacts only
    after ownership, Git, age, mount, file-type, hard-link, process-use, and
    identity revalidation checks pass.
-4. Cooperative tool shims serialize recognized heavy builds. Tests, lint, type
-   checks, checks, end-to-end tests, and installs always run directly.
+4. Tool shims and `guard exec` forward development commands directly.
 5. Every cleanup intent and outcome is written to a private JSONL audit log.
 
 GuardWSL does **not** run a Windows service, control Hyper-V, compact or convert
@@ -43,8 +42,7 @@ Requirements:
 
 - WSL2 with systemd enabled;
 - Windows PowerShell interoperability from WSL;
-- Rust 1.98.0, Cargo, Bash, and `flock`;
-- enough host disk and RAM for the installation build.
+- Rust 1.98.0, Cargo, and Bash.
 
 Review the installer before running it:
 
@@ -72,25 +70,21 @@ Daily operation is automatic. Commands exist to inspect, diagnose, configure,
 or explicitly toggle policies:
 
 ```text
-guard doctor                           # Check host interop, backing volume, and locks
-guard status                           # Inspect Windows disk/RAM pressure and gate state
+guard doctor                           # Check host interop and backing volume
+guard status                           # Inspect Windows disk/RAM pressure
 guard clean --dry-run                  # Simulate cleanup without deleting files
 guard clean                            # Run safe, allowlist-only cleanup on demand
-guard admission status                 # Show whether heavy-build serialization is active
-guard admission off                    # Disable heavy-build queuing (for uncoordinated parallel builds)
-guard admission on                     # Re-enable heavy-build serialization
 guard config show                      # Display active configuration and thresholds
 guard config init                      # Create or reset ~/.config/guardwsl/config.toml
 guard config validate                  # Validate configuration bounds and syntax
 guard history                          # View recent cleanup audit log entries
-guard exec -- <command> [args...]      # Run a command under Guard preflight and locks
+guard exec -- <command> [args...]      # Forward a command directly
 ```
 
 ### Key configuration notes
 
-- **Heavy-Build Gate (`guard admission off / on`):** `guard admission off` disables the single-build queue. Use it if you prefer uncoordinated builds on your machine.
-- **Tests & Linters Always Direct:** Commands such as `cargo test`, `npm test`, `pytest`, `cargo clippy`, `tsc`, `lint`, and `fmt` are classified as checks and **never acquire locks, wait in queues, or fail from admission controls** in any mode.
-- **Custom Thresholds:** Adjust disk minimums, memory floors, scan roots, and protected paths in `~/.config/guardwsl/config.toml`. See the complete [configuration reference](docs/CONFIGURATION.md).
+- **Development commands:** `guard exec` and installed shims forward commands directly; they never take locks or reject a command from host telemetry.
+- **Custom thresholds:** Adjust disk pressure, scan roots, and protected paths in `~/.config/guardwsl/config.toml`. See the complete [configuration reference](docs/CONFIGURATION.md).
 
 ## Exact cleanup scope
 
@@ -113,18 +107,11 @@ common credential and control directories such as `.ssh`, `.gnupg`, `.config`,
 
 Read the full [safety model](docs/SAFETY.md) before enabling real cleanup.
 
-## Heavy-build coordination
+## Development commands
 
-The default preflight requires 64 GiB free on the physical WSL backing volume
-and 12 GiB of available physical Windows RAM: an 8 GiB host floor plus 4 GiB of
-build headroom. Values are configurable in
-`~/.config/guardwsl/config.toml`. See the complete
-[configuration reference](docs/CONFIGURATION.md).
-
-The build gate is cooperative. Normal tool entry points are covered by user
-shims, but an absolute executable path outside those shims can bypass it. The
-kernel releases locks when processes exit; GuardWSL has no distributed queue or
-lease service. See [Build coordination](docs/BUILD-COORDINATION.md).
+GuardWSL observes host disk and RAM for status and cleanup decisions only.
+Installed shims and `guard exec` forward builds and all other development
+commands directly; they never queue, lock, or reject commands.
 
 ## Physical disk accounting and sparse VHDX
 
