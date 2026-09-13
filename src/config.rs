@@ -615,9 +615,9 @@ mod tests {
     }
 
     #[test]
-    fn defaults_keep_disk_safety_independent_from_admission() {
+    fn defaults_disable_build_admission_while_preserving_cleanup() {
         let config = test_default();
-        assert!(config.admission.enabled);
+        assert!(!config.admission.enabled);
         assert!(config.cleanup.enabled);
         assert_eq!(
             config.cleanup.scan_roots,
