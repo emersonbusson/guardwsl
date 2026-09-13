@@ -35,8 +35,7 @@ chmod 0700 "$temporary"
 mv -f -- "$temporary" "$dispatcher"
 trap - EXIT
 
-# rustc is an internal Cargo detail. Intercepting it would make cargo test/check
-# depend on the heavy-build preflight, which violates the GuardWSL contract.
+# rustc is an internal Cargo detail and is intentionally not intercepted.
 retired_rustc="$shim_dir/rustc"
 if [[ -L "$retired_rustc" ]] &&
   [[ "$(readlink -- "$retired_rustc")" == "$(basename -- "$dispatcher")" ]]; then

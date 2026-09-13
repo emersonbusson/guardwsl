@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 #[command(
     name = "guard",
     version,
-    about = "Simple protection against full disks and concurrent heavy builds in WSL2"
+    about = "Safe cache cleanup and host pressure monitoring for WSL2"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -30,7 +30,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Shows physical disk, RAM, monitor, and active-build state.
+    /// Shows physical disk, RAM, and monitor state.
     Status(OutputArgs),
     /// Removes only revalidated, regenerable caches and artifacts.
     Clean(CleanArgs),
