@@ -14,7 +14,7 @@ O desenho é deliberadamente conservador: na dúvida, os dados são preservados.
 
 ## Status
 
-A versão atual do código é `0.1.0`. Seus 50 testes Rust, formatter, Clippy,
+A versão atual do código é `0.1.0`. Seus testes Rust, formatter, Clippy,
 sintaxe shell, auditoria de dependências e política de dependências passam
 localmente. Ainda não há uma versão pública estável; revise um dry-run antes de
 ativar limpeza real em qualquer máquina.
@@ -22,8 +22,7 @@ ativar limpeza real em qualquer máquina.
 ## O que a v1 faz
 
 1. `guard status` mostra o disco físico do host, a RAM física do Windows, o
-   caminho e atributo sparse do VHDX atual, a saúde do monitor e o gate de
-   builds.
+   caminho e atributo sparse do VHDX atual e a saúde do monitor.
 2. Um monitor systemd de usuário executa manutenção por idade e reage à pressão
    no volume físico do host.
 3. Uma allowlist exata permite limpar somente caches e artefatos conhecidos
