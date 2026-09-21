@@ -5,7 +5,10 @@ use guardwsl::cleanup::{CleanupMode, CleanupReport, execute_cleanup, plan_cleanu
 use guardwsl::config::{ConfigStore, GuardConfig};
 use guardwsl::fsutil::{atomic_write_private, default_state_dir, ensure_private_dir, read_private};
 use guardwsl::history::AuditLog;
-use guardwsl::host::{DiskPressure, HostSnapshot, PowerShellHostProbe, classify_disk};
+use guardwsl::host::{
+    DiskPressure, HostPlatform, HostSnapshot, PowerShellHostProbe, classify_disk, current_platform,
+    probe_linux_disk,
+};
 use guardwsl::maintenance_lock::MaintenanceLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,7 +24,7 @@ use std::time::{Duration, Instant};
 #[command(
     name = "guard",
     version,
-    about = "Safe cache cleanup and host pressure monitoring for WSL2"
+    about = "Safe cache cleanup and host-disk pressure monitoring for Linux and WSL2"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -30,7 +33,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Shows physical disk, RAM, and monitor state.
+    /// Shows physical host disk and monitor state.
     Status(OutputArgs),
     /// Removes only revalidated, regenerable caches and artifacts.
     Clean(CleanArgs),
@@ -39,7 +42,7 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Runs a command under GuardWSL policy.
+    /// Forwards a command directly to the underlying tool.
     Exec(ExecArgs),
     /// Runs diagnostics and always prints every check.
     Doctor(OutputArgs),
@@ -143,10 +146,13 @@ fn status(args: OutputArgs) -> Result<i32> {
             value
         })
     });
-    let pressure = host
-        .as_ref()
-        .ok()
-        .map(|snapshot| classify_disk(snapshot.volume_free_bytes, &config.disk));
+    let pressure = host.as_ref().ok().map(|snapshot| {
+        classify_disk(
+            snapshot.volume_free_bytes,
+            snapshot.volume_total_bytes,
+            &config.disk,
+        )
+    });
     let report = json!({
         "service": "guardwsl",
         "version": env!("CARGO_PKG_VERSION"),
@@ -210,27 +216,29 @@ fn print_status(report: &Value) {
     );
     if let Some(host) = report["host"].as_object() {
         println!(
-            "Disk {}: {} free of {} ({})",
+            "Host disk {}: {} free of {} ({})",
             host["volume_root"].as_str().unwrap_or("?"),
             format_bytes(host["volume_free_bytes"].as_u64().unwrap_or(0)),
             format_bytes(host["volume_total_bytes"].as_u64().unwrap_or(0)),
             report["pressure"].as_str().unwrap_or("unknown"),
         );
-        println!(
-            "Windows RAM: {} available of {}",
-            format_bytes(host["host_available_memory_bytes"].as_u64().unwrap_or(0)),
-            format_bytes(host["host_total_memory_bytes"].as_u64().unwrap_or(0)),
-        );
-        println!(
-            "WSL: {} at {} | sparse VHDX: {}",
-            host["distro"].as_str().unwrap_or("?"),
-            host["vhdx_path"].as_str().unwrap_or("?"),
-            if host["vhdx_sparse"].as_bool() == Some(true) {
-                "yes"
-            } else {
-                "no - deletion frees ext4 space but does not shrink the physical file"
-            }
-        );
+        match host["platform"].as_str() {
+            Some("wsl2") => println!(
+                "WSL2/Windows backing volume: {} at {} | sparse VHDX: {}",
+                host["distro"].as_str().unwrap_or("?"),
+                host["vhdx_path"].as_str().unwrap_or("?"),
+                if host["vhdx_sparse"].as_bool() == Some(true) {
+                    "yes"
+                } else {
+                    "no - deletion frees ext4 space but does not shrink the physical file"
+                }
+            ),
+            Some("linux") => println!(
+                "Linux local filesystem: {}",
+                host["volume_root"].as_str().unwrap_or("?")
+            ),
+            _ => println!("Host platform: unknown"),
+        }
     } else {
         println!(
             "Host: unavailable ({})",
@@ -311,7 +319,11 @@ fn clean(args: CleanArgs) -> Result<i32> {
     }
     let _lock = MaintenanceLock::acquire(Duration::from_secs(30))?;
     let snapshot = probe_host(&loaded.config)?;
-    let pressure = classify_disk(snapshot.volume_free_bytes, &loaded.config.disk);
+    let pressure = classify_disk(
+        snapshot.volume_free_bytes,
+        snapshot.volume_total_bytes,
+        &loaded.config.disk,
+    );
     let cycle = run_cleanup(
         &loaded.config,
         pressure,
@@ -347,6 +359,7 @@ fn run_cleanup(
     {
         let logical_budget = config
             .disk
+            .effective_thresholds(snapshot.volume_total_bytes)
             .target_free_bytes
             .saturating_sub(snapshot.volume_free_bytes);
         let mut selected = 0_u64;
@@ -616,9 +629,11 @@ fn doctor(args: OutputArgs) -> Result<i32> {
         Ok(snapshot) => checks.push(json!({
             "name":"host_probe",
             "ok":true,
-            "detail":{"volume":snapshot.volume_root,"free_bytes":snapshot.volume_free_bytes,"memory_free_bytes":snapshot.host_available_memory_bytes}
+            "detail":{"volume":snapshot.volume_root,"free_bytes":snapshot.volume_free_bytes}
         })),
-        Err(error) => checks.push(json!({"name":"host_probe","ok":false,"detail":error.to_string()})),
+        Err(error) => {
+            checks.push(json!({"name":"host_probe","ok":false,"detail":error.to_string()}))
+        }
     }
     let monitor = read_monitor_status(&config);
     checks.push(json!({
@@ -726,7 +741,11 @@ fn monitor(args: MonitorArgs) -> Result<i32> {
         let host = config_ready.then(|| probe_host(&config));
         match host {
             Some(Ok(snapshot)) => {
-                let current = classify_disk(snapshot.volume_free_bytes, &config.disk);
+                let current = classify_disk(
+                    snapshot.volume_free_bytes,
+                    snapshot.volume_total_bytes,
+                    &config.disk,
+                );
                 pressure = Some(current);
                 let pressure_due =
                     current != DiskPressure::Healthy && Instant::now() >= next_pressure_cleanup;
@@ -738,8 +757,11 @@ fn monitor(args: MonitorArgs) -> Result<i32> {
                 {
                     match probe_host(&config) {
                         Ok(fresh_snapshot) => {
-                            let fresh_pressure =
-                                classify_disk(fresh_snapshot.volume_free_bytes, &config.disk);
+                            let fresh_pressure = classify_disk(
+                                fresh_snapshot.volume_free_bytes,
+                                fresh_snapshot.volume_total_bytes,
+                                &config.disk,
+                            );
                             pressure = Some(fresh_pressure);
                             match run_cleanup(
                                 &config,
@@ -805,7 +827,10 @@ fn write_monitor_status(status: &MonitorStatus) -> Result<()> {
 
 fn probe_host(config: &GuardConfig) -> Result<HostSnapshot> {
     let timeout = Duration::from_secs(config.disk.host_probe_timeout_seconds);
-    let snapshot = PowerShellHostProbe::new(timeout).probe()?;
+    let snapshot = match current_platform()? {
+        HostPlatform::Linux => probe_linux_disk(&config.cleanup.scan_roots)?,
+        HostPlatform::Wsl2 => PowerShellHostProbe::new(timeout).probe()?,
+    };
     snapshot.require_fresh(timeout.saturating_mul(2))?;
     Ok(snapshot)
 }
@@ -862,9 +887,8 @@ mod tests {
     }
 
     #[test]
-    fn disabled_build_admission_does_not_imply_disabled_cleanup() {
-        let mut config = GuardConfig::default();
-        config.admission.enabled = false;
+    fn default_cleanup_remains_enabled() {
+        let config = GuardConfig::default();
         assert!(config.cleanup.enabled);
     }
 

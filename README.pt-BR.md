@@ -6,8 +6,7 @@ Idioma: [English](README.md)
 > canônica para comportamento, requisitos e limites de segurança.
 
 GuardWSL é uma ferramenta pequena e restrita ao usuário para proteger máquinas
-de desenvolvimento com WSL2. Ela observa o volume físico do Windows que contém
-a distribuição atual, remove somente artefatos comprovadamente regeneráveis e
+de desenvolvimento com Linux nativo ou WSL2. Ela observa o filesystem local no Linux nativo ou o volume físico do Windows que contém a distribuição WSL2 atual, remove somente artefatos comprovadamente regeneráveis e
 não controla comandos de desenvolvimento.
 
 O desenho é deliberadamente conservador: na dúvida, os dados são preservados.
@@ -21,10 +20,9 @@ ativar limpeza real em qualquer máquina.
 
 ## O que a v1 faz
 
-1. `guard status` mostra o disco físico do host, a RAM física do Windows, o
-   caminho e atributo sparse do VHDX atual e a saúde do monitor.
+1. `guard status` mostra a pressão no disco do host e a saúde do monitor. No WSL2 também mostra o caminho e atributo sparse do VHDX atual.
 2. Um monitor systemd de usuário executa manutenção por idade e reage à pressão
-   no volume físico do host.
+   no disco do host.
 3. Uma allowlist exata permite limpar somente caches e artefatos conhecidos
    após validar proprietário, Git, idade, mount, tipo, hard links, uso por
    processo e identidade.
@@ -43,8 +41,8 @@ provar que um artefato candidato é regenerável e seguro para remoção.
 
 Requisitos:
 
-- WSL2 com systemd habilitado;
-- interoperabilidade com Windows PowerShell;
+- Linux nativo ou WSL2 com systemd habilitado;
+- no WSL2, interoperabilidade com Windows PowerShell;
 - Rust 1.98.0, Cargo e Bash.
 
 Revise o instalador antes de executá-lo:
@@ -74,8 +72,8 @@ O uso cotidiano é automático. Os comandos existem para inspecionar, diagnostic
 ou alternar políticas:
 
 ```text
-guard doctor                           # Verifica interop com o host e volume
-guard status                           # Inspeciona pressão de disco/RAM
+guard doctor                           # Verifica a sonda de disco correspondente
+guard status                           # Inspeciona pressão no disco do host
 guard clean --dry-run                  # Simula a limpeza sem apagar nenhum arquivo
 guard clean                            # Executa limpeza segura restrita à allowlist sob demanda
 guard config show                      # Exibe a configuração e limites ativos
@@ -87,7 +85,7 @@ guard exec -- <comando> [args...]      # Encaminha um comando diretamente
 
 ### Notas importantes de configuração
 
-- **Comandos de desenvolvimento:** shims e `guard exec` nunca adquirem locks nem rejeitam comandos por RAM/disco.
+- **Comandos de desenvolvimento:** shims e `guard exec` encaminham comandos diretamente, sem fila ou bloqueio.
 - **Limites personalizados:** ajuste pressão de disco, raízes e caminhos protegidos em `~/.config/guardwsl/config.toml`.
 
 ## Escopo exato da limpeza
@@ -113,14 +111,16 @@ Leia o [modelo de segurança](docs/SAFETY.md) antes de ativar limpeza real.
 
 ## Comandos de desenvolvimento
 
-O GuardWSL observa disco e RAM apenas para status e decisões de limpeza. Builds e
+O GuardWSL observa a pressão no disco físico para status e decisões de limpeza. Builds e
 demais comandos são encaminhados diretamente, sem fila, lock ou preflight.
 
-## Disco físico e VHDX sparse
+## Disco do host e VHDX sparse
 
-O espaço físico livre do Windows é autoritativo. O `df` do Linux é apenas
+No Linux nativo, é autoritativo o espaço disponível no filesystem local das raízes configuradas; raízes em filesystems distintos são rejeitadas. No WSL2, o espaço físico livre do Windows é autoritativo. O `df` do guest é apenas
 diagnóstico, pois um VHDX ext4 dinâmico pode informar capacidade virtual livre
 enquanto o volume físico do Windows está quase cheio.
+
+Os limites de pressão são limitados proporcionalmente à capacidade observada, para que um disco pequeno não permaneça sempre sob pressão. Os valores configurados em bytes continuam sendo limites superiores. A limpeza é limitada pela meta efetiva e nunca bloqueia comandos de desenvolvimento.
 
 `sparseVhd=true` na `.wslconfig` vale automaticamente para VHDs novos; isso não
 prova que um VHDX existente está sparse. GuardWSL consulta o atributo real e

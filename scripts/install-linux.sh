@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 repo_dir="$(cd -- "$script_dir/.." && pwd -P)"
+source "$script_dir/platform.sh"
 guard_bin="$HOME/.local/bin/guard"
 unit_dir="$HOME/.config/systemd/user"
 unit_path="$unit_dir/guardwsl.service"
@@ -16,6 +17,7 @@ timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 backup_root="$state_root/install-backups/$timestamp"
 cargo_bin="$HOME/.cargo/bin/cargo"
 distro_name="${WSL_DISTRO_NAME:-}"
+platform="$(guard_platform_from_release "$(</proc/sys/kernel/osrelease)")"
 real_tool_path=""
 IFS=: read -r -a path_entries <<<"${PATH:-}"
 for path_entry in "${path_entries[@]}"; do
@@ -30,16 +32,18 @@ done
 }
 umask 077
 
-[[ -n "$distro_name" ]] || {
-  printf 'This installer must run inside WSL2.\n' >&2
-  exit 1
-}
+if [[ "$platform" == wsl2 ]]; then
+  [[ -n "$distro_name" ]] || {
+    printf 'WSL_DISTRO_NAME is required for a WSL2 installation.\n' >&2
+    exit 1
+  }
+  [[ "$distro_name" =~ ^[[:alnum:]._-]+$ ]] || {
+    printf 'The WSL distribution name is unsafe for installation: %s\n' "$distro_name" >&2
+    exit 1
+  }
+fi
 [[ -x "$cargo_bin" ]] || {
   printf 'The real Cargo executable was not found at %s\n' "$cargo_bin" >&2
-  exit 1
-}
-[[ "$distro_name" =~ ^[[:alnum:]._-]+$ ]] || {
-  printf 'The WSL distribution name is unsafe for installation: %s\n' "$distro_name" >&2
   exit 1
 }
 for managed_path in "$guard_bin" "$unit_path" "$config_path" "$config_lkg_path" "$shim_dir" "$distro_path" "$environment_path"; do
@@ -147,10 +151,12 @@ if [[ -e "$config_path" ]]; then
 else
   "$guard_bin" config init
 fi
-distro_tmp="$(mktemp "$state_root/.distro-name.XXXXXX")"
-printf '%s\n' "$distro_name" >"$distro_tmp"
-chmod 0600 "$distro_tmp"
-mv -f -- "$distro_tmp" "$distro_path"
+if [[ "$platform" == wsl2 ]]; then
+  distro_tmp="$(mktemp "$state_root/.distro-name.XXXXXX")"
+  printf '%s\n' "$distro_name" >"$distro_tmp"
+  chmod 0600 "$distro_tmp"
+  mv -f -- "$distro_tmp" "$distro_path"
+fi
 bash "$repo_dir/scripts/install-shims.sh" "$guard_bin"
 
 systemctl --user daemon-reload

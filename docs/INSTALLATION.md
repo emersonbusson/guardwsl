@@ -2,8 +2,8 @@
 
 ## Requirements
 
-- WSL2 with systemd enabled;
-- Windows PowerShell interoperability from WSL;
+- Native Linux or WSL2 with systemd enabled;
+- on WSL2, Windows PowerShell interoperability;
 - Rust 1.98.0, Cargo, and Bash.
 
 Review `scripts/install-linux.sh` before running it. The installer is
@@ -25,6 +25,7 @@ The installer:
 4. briefly stops the old monitor, then installs `~/.local/bin/guard`, the
    systemd user unit, and tool shims;
 5. initializes or strictly normalizes the private configuration;
+   on WSL2 it also records the current distribution name for backing-volume discovery;
 6. enables the monitor and waits for `guard doctor` to become healthy;
 7. rolls back all managed files if any activation step fails.
 

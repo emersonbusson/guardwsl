@@ -9,9 +9,9 @@ and the project intends to use [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Host-aware physical disk and RAM status for the current WSL2 distribution.
+- Host-aware disk status for native Linux filesystems and the current WSL2 distribution's physical Windows backing volume.
 - Conservative cleanup with exact allowlists, dry run, revalidation, and audit
   records.
-- Cooperative serialization for recognized heavy builds.
+- Direct forwarding of development commands without build admission.
 - A user-scoped systemd monitor and transactional installer.
 - English canonical documentation and a Portuguese (Brazil) README.

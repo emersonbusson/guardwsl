@@ -9,7 +9,7 @@
 - Safety is the product. Never delete source code, Git data, configuration, secrets, databases, uploads, Docker data or any unclassified path.
 - Cleanup is exact-allowlist only. Every action supports dry-run, writes an audit intent before mutation, revalidates identity, rejects symlink/mount traversal and skips paths used by active same-user processes.
 - Report logical bytes removed separately from physical host space observed. With WSL sparse VHD enabled, Linux deletion may return host blocks gradually; Guard must never claim instant physical reclaim.
-- Host physical free space is authoritative for WSL2 pressure decisions; guest `df` is diagnostic only. Discover the current distribution backing volume dynamically and never hardcode a drive letter.
+- On native Linux, available space on the scan roots' local filesystem is authoritative. On WSL2, host physical free space is authoritative and guest `df` is diagnostic only. Discover the current distribution backing volume dynamically and never hardcode a drive letter.
 - Invalid configuration fails closed and preserves the last-known-good configuration. Destructive tests use isolated temporary directories only.
-- Shims and `guard exec` forward every command directly. GuardWSL never serializes or blocks development commands based on host telemetry, disk pressure, RAM, or cleanup state.
+- Shims and `guard exec` forward every command directly. GuardWSL never serializes or blocks development commands based on host telemetry, disk pressure, or cleanup state.
 - Every user-visible behavior and recovery procedure stays documented in this repository. GuardWSL does not own application-domain policy.

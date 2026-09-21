@@ -4,6 +4,7 @@ use guardwsl::host::HostSnapshot;
 fn host_snapshot_accepts_disk_only_v2_without_ram_fields() {
     let raw = r#"{
       "schema_version":2,
+      "platform":"wsl2",
       "captured_at":"2026-08-23T12:00:00Z",
       "distro":"Example-WSL",
       "vhdx_path":"X:\\WSL\\Example-WSL\\ext4.vhdx",

@@ -1,13 +1,14 @@
 //! A single read-only host probe. It never starts, pauses, or stops a VM or WSL.
 
-use crate::config::{DiskConfig, GuardConfig};
+use crate::config::DiskConfig;
 use crate::fsutil::{default_state_dir, read_private};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::io::{self, Read};
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
@@ -43,9 +44,9 @@ try {
   $volumeSize = [uint64]$drive.TotalSize
   $volumeFree = [uint64]$drive.AvailableFreeSpace
 }
-$os = Get-CimInstance -ClassName Win32_OperatingSystem
 [pscustomobject]@{
-  schema_version = 1
+  schema_version = 2
+  platform = 'wsl2'
   captured_at = (Get-Date).ToUniversalTime().ToString('o')
   distro = $distroName
   vhdx_path = $vhdxPath
@@ -53,45 +54,88 @@ $os = Get-CimInstance -ClassName Win32_OperatingSystem
   volume_root = $volumeRoot
   volume_total_bytes = $volumeSize
   volume_free_bytes = $volumeFree
-  host_total_memory_bytes = [uint64]$os.TotalVisibleMemorySize * 1024
-  host_available_memory_bytes = [uint64]$os.FreePhysicalMemory * 1024
 } | ConvertTo-Json -Compress
 "#;
 const MAX_PROBE_OUTPUT_BYTES: usize = 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostPlatform {
+    Linux,
+    Wsl2,
+}
+
+pub fn classify_platform(kernel_release: &str) -> Result<HostPlatform> {
+    let release = kernel_release.to_ascii_lowercase();
+    if release.contains("microsoft") {
+        if release.contains("wsl2") {
+            Ok(HostPlatform::Wsl2)
+        } else {
+            bail!("WSL1 is not supported")
+        }
+    } else {
+        Ok(HostPlatform::Linux)
+    }
+}
+
+pub fn current_platform() -> Result<HostPlatform> {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .context("could not identify the Linux kernel")?;
+    classify_platform(release.trim())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostSnapshot {
     pub schema_version: u32,
+    pub platform: HostPlatform,
     pub captured_at: DateTime<Utc>,
-    pub distro: String,
-    pub vhdx_path: String,
-    pub vhdx_sparse: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distro: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vhdx_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vhdx_sparse: Option<bool>,
     pub volume_root: String,
     pub volume_total_bytes: u64,
     pub volume_free_bytes: u64,
-    pub host_total_memory_bytes: u64,
-    pub host_available_memory_bytes: u64,
 }
 
 impl HostSnapshot {
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 1
-            || self.distro.trim().is_empty()
-            || self.vhdx_path.trim().is_empty()
+        if self.schema_version != 2
             || self.volume_root.trim().is_empty()
             || self.volume_total_bytes == 0
             || self.volume_free_bytes > self.volume_total_bytes
-            || self.host_total_memory_bytes == 0
-            || self.host_available_memory_bytes > self.host_total_memory_bytes
         {
             bail!("host snapshot has invalid geometry or identity")
         }
-        if self
-            .distro
-            .chars()
-            .chain(self.vhdx_path.chars())
-            .chain(self.volume_root.chars())
-            .any(char::is_control)
+        let wsl_identity_valid = match self.platform {
+            HostPlatform::Wsl2 => self
+                .distro
+                .as_ref()
+                .zip(self.vhdx_path.as_ref())
+                .is_some_and(|(distro, path)| {
+                    !distro.trim().is_empty()
+                        && !path.trim().is_empty()
+                        && self.vhdx_sparse.is_some()
+                }),
+            HostPlatform::Linux => {
+                self.distro.is_none() && self.vhdx_path.is_none() && self.vhdx_sparse.is_none()
+            }
+        };
+        if !wsl_identity_valid {
+            bail!("host snapshot has invalid platform identity")
+        }
+        if self.volume_root.chars().any(char::is_control)
+            || self
+                .distro
+                .as_ref()
+                .is_some_and(|value| value.chars().any(char::is_control))
+            || self
+                .vhdx_path
+                .as_ref()
+                .is_some_and(|value| value.chars().any(char::is_control))
         {
             bail!("host snapshot contains a control character")
         }
@@ -135,39 +179,74 @@ impl DiskPressure {
 }
 
 #[must_use]
-pub fn classify_disk(free_bytes: u64, config: &DiskConfig) -> DiskPressure {
-    if free_bytes <= config.emergency_free_bytes {
+pub fn classify_disk(free_bytes: u64, total_bytes: u64, config: &DiskConfig) -> DiskPressure {
+    let thresholds = config.effective_thresholds(total_bytes);
+    if free_bytes <= thresholds.emergency_free_bytes {
         DiskPressure::Emergency
-    } else if free_bytes <= config.critical_free_bytes {
+    } else if free_bytes <= thresholds.critical_free_bytes {
         DiskPressure::Critical
-    } else if free_bytes <= config.pressure_free_bytes {
+    } else if free_bytes <= thresholds.pressure_free_bytes {
         DiskPressure::Pressure
     } else {
         DiskPressure::Healthy
     }
 }
 
-pub fn ensure_build_headroom(snapshot: &HostSnapshot, config: &GuardConfig) -> Result<()> {
+pub fn probe_linux_disk(scan_roots: &[PathBuf]) -> Result<HostSnapshot> {
+    let (first, rest) = scan_roots
+        .split_first()
+        .context("no cleanup scan root configured")?;
+    let first_meta = std::fs::symlink_metadata(first)
+        .with_context(|| format!("could not inspect scan root {}", first.display()))?;
+    if !first.is_absolute() || first_meta.file_type().is_symlink() || !first_meta.is_dir() {
+        bail!("unsafe Linux scan root: {}", first.display())
+    }
+    let device = first_meta.dev();
+    for root in rest {
+        let metadata = std::fs::symlink_metadata(root)
+            .with_context(|| format!("could not inspect scan root {}", root.display()))?;
+        if !root.is_absolute()
+            || metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.dev() != device
+        {
+            bail!("Linux scan roots must be directories on one filesystem")
+        }
+    }
+    let canonical = std::fs::canonicalize(first)?;
+    let path = CString::new(canonical.as_os_str().as_bytes())?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: the path is NUL-terminated and stats points to writable storage.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error()).context("could not read Linux filesystem capacity");
+    }
+    // SAFETY: statvfs returned success and initialized the output structure.
+    let stats = unsafe { stats.assume_init() };
+    let block_size = stats.f_frsize;
+    let total = stats
+        .f_blocks
+        .checked_mul(block_size)
+        .context("filesystem size overflow")?;
+    let free = stats
+        .f_bavail
+        .checked_mul(block_size)
+        .context("filesystem free-space overflow")?;
+    let snapshot = HostSnapshot {
+        schema_version: 2,
+        platform: HostPlatform::Linux,
+        captured_at: Utc::now(),
+        distro: None,
+        vhdx_path: None,
+        vhdx_sparse: None,
+        volume_root: canonical
+            .to_str()
+            .context("scan root is not UTF-8")?
+            .to_owned(),
+        volume_total_bytes: total,
+        volume_free_bytes: free,
+    };
     snapshot.validate()?;
-    if snapshot.volume_free_bytes < config.disk.target_free_bytes {
-        bail!(
-            "build blocked: volume {} has less than the preventive target of {} bytes",
-            snapshot.volume_root,
-            config.disk.target_free_bytes
-        )
-    }
-    let required_memory = config
-        .memory
-        .host_floor_bytes
-        .saturating_add(config.memory.build_headroom_bytes);
-    if snapshot.host_available_memory_bytes < required_memory {
-        bail!(
-            "build blocked: host has {} available bytes; {} are required",
-            snapshot.host_available_memory_bytes,
-            required_memory
-        )
-    }
-    Ok(())
+    Ok(snapshot)
 }
 
 #[derive(Debug, Clone)]
@@ -411,19 +490,19 @@ mod tests {
     fn pressure_thresholds_are_total_and_ordered() {
         let config = GuardConfig::default();
         assert_eq!(
-            classify_disk(config.disk.target_free_bytes, &config.disk),
+            classify_disk(config.disk.target_free_bytes, 500 * GIB, &config.disk),
             DiskPressure::Healthy
         );
         assert_eq!(
-            classify_disk(config.disk.pressure_free_bytes, &config.disk),
+            classify_disk(config.disk.pressure_free_bytes, 500 * GIB, &config.disk),
             DiskPressure::Pressure
         );
         assert_eq!(
-            classify_disk(config.disk.critical_free_bytes, &config.disk),
+            classify_disk(config.disk.critical_free_bytes, 500 * GIB, &config.disk),
             DiskPressure::Critical
         );
         assert_eq!(
-            classify_disk(config.disk.emergency_free_bytes, &config.disk),
+            classify_disk(config.disk.emergency_free_bytes, 500 * GIB, &config.disk),
             DiskPressure::Emergency
         );
     }
@@ -431,57 +510,35 @@ mod tests {
     #[test]
     fn nul_padded_powershell_json_is_accepted() {
         let raw = br#"{
-          "schema_version":1,
+          "schema_version":2,
+          "platform":"wsl2",
           "captured_at":"2026-08-23T12:00:00Z",
           "distro":"Example-WSL",
           "vhdx_path":"X:\\WSL\\Example-WSL\\ext4.vhdx",
           "vhdx_sparse":false,
           "volume_root":"X:\\",
           "volume_total_bytes":1000,
-          "volume_free_bytes":500,
-          "host_total_memory_bytes":1000,
-          "host_available_memory_bytes":500
+          "volume_free_bytes":500
         }"#;
         let padded = raw.iter().flat_map(|byte| [*byte, 0]).collect::<Vec<_>>();
-        assert_eq!(parse_snapshot(&padded).unwrap().distro, "Example-WSL");
-    }
-
-    #[test]
-    fn build_requires_disk_and_memory_headroom() {
-        let config = GuardConfig::default();
-        let mut snapshot = HostSnapshot {
-            schema_version: 1,
-            captured_at: Utc::now(),
-            distro: "Example-WSL".to_owned(),
-            vhdx_path: r"X:\WSL\Example-WSL\ext4.vhdx".to_owned(),
-            vhdx_sparse: false,
-            volume_root: r"X:\".to_owned(),
-            volume_total_bytes: 200 * GIB,
-            volume_free_bytes: 80 * GIB,
-            host_total_memory_bytes: 32 * GIB,
-            host_available_memory_bytes: 16 * GIB,
-        };
-        ensure_build_headroom(&snapshot, &config).unwrap();
-        snapshot.host_available_memory_bytes = 11 * GIB;
-        assert!(ensure_build_headroom(&snapshot, &config).is_err());
-        snapshot.host_available_memory_bytes = 16 * GIB;
-        snapshot.volume_free_bytes = config.disk.target_free_bytes - 1;
-        assert!(ensure_build_headroom(&snapshot, &config).is_err());
+        assert_eq!(
+            parse_snapshot(&padded).unwrap().distro.as_deref(),
+            Some("Example-WSL")
+        );
     }
 
     #[test]
     fn freshness_tolerates_small_windows_wsl_clock_skew() {
         let mut snapshot = HostSnapshot {
-            schema_version: 1,
+            schema_version: 2,
+            platform: HostPlatform::Wsl2,
             captured_at: Utc::now() + chrono::Duration::seconds(2),
-            distro: "Example-WSL".to_owned(),
-            vhdx_path: r"X:\WSL\Example-WSL\ext4.vhdx".to_owned(),
-            vhdx_sparse: false,
+            distro: Some("Example-WSL".to_owned()),
+            vhdx_path: Some(r"X:\WSL\Example-WSL\ext4.vhdx".to_owned()),
+            vhdx_sparse: Some(false),
             volume_root: r"X:\".to_owned(),
             volume_total_bytes: 200 * GIB,
             volume_free_bytes: 80 * GIB,
-            host_total_memory_bytes: 32 * GIB,
-            host_available_memory_bytes: 16 * GIB,
         };
         snapshot.require_fresh(Duration::from_secs(10)).unwrap();
         snapshot.captured_at = Utc::now() + chrono::Duration::seconds(10);

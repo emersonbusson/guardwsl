@@ -2,8 +2,8 @@
 
 Language: [Portuguese (Brazil)](README.pt-BR.md)
 
-GuardWSL is a small, user-scoped safety tool for WSL2 development machines. It
-observes the physical Windows volume that backs the current distribution,
+GuardWSL is a small, user-scoped safety tool for native Linux and WSL2 development machines. It
+observes the local Linux filesystem on native Linux or the physical Windows volume backing the current WSL2 distribution,
 removes only proven regenerable artifacts, and never controls development
 commands.
 
@@ -18,10 +18,9 @@ real cleanup on any machine.
 
 ## What v1 does
 
-1. `guard status` reports physical host disk, physical Windows RAM, the current
-   WSL VHDX location and sparse attribute, and monitor health.
+1. `guard status` reports host-disk pressure and monitor health. On WSL2 it also reports the current VHDX location and sparse attribute.
 2. A systemd user monitor performs age-based maintenance and reacts to physical
-   host-volume pressure.
+   host-disk pressure.
 3. An exact allowlist permits cleanup of known caches and build artifacts only
    after ownership, Git, age, mount, file-type, hard-link, process-use, and
    identity revalidation checks pass.
@@ -40,8 +39,8 @@ prove that a candidate artifact is regenerable and safe to remove.
 
 Requirements:
 
-- WSL2 with systemd enabled;
-- Windows PowerShell interoperability from WSL;
+- Native Linux or WSL2 with systemd enabled;
+- On WSL2, Windows PowerShell interoperability;
 - Rust 1.98.0, Cargo, and Bash.
 
 Review the installer before running it:
@@ -70,8 +69,8 @@ Daily operation is automatic. Commands exist to inspect, diagnose, configure,
 or explicitly toggle policies:
 
 ```text
-guard doctor                           # Check host interop and backing volume
-guard status                           # Inspect Windows disk/RAM pressure
+guard doctor                           # Check the relevant host-disk probe
+guard status                           # Inspect host-disk pressure
 guard clean --dry-run                  # Simulate cleanup without deleting files
 guard clean                            # Run safe, allowlist-only cleanup on demand
 guard config show                      # Display active configuration and thresholds
@@ -109,15 +108,17 @@ Read the full [safety model](docs/SAFETY.md) before enabling real cleanup.
 
 ## Development commands
 
-GuardWSL observes host disk and RAM for status and cleanup decisions only.
+GuardWSL observes host-disk pressure for status and cleanup decisions only.
 Installed shims and `guard exec` forward builds and all other development
 commands directly; they never queue, lock, or reject commands.
 
-## Physical disk accounting and sparse VHDX
+## Host-disk accounting and sparse VHDX
 
-Windows physical free space is authoritative. Guest `df` output is diagnostic
+On native Linux, free space on the local filesystem containing the configured scan roots is authoritative; roots on different filesystems are rejected. On WSL2, Windows physical free space is authoritative. Guest `df` output is diagnostic
 because a dynamically growing ext4 VHDX can report free virtual capacity while
 its physical Windows volume is nearly full.
+
+Disk thresholds are capped relative to the observed filesystem size, so a small disk does not remain permanently in pressure. Configured byte thresholds remain upper bounds. Cleanup stays bounded by the effective target and never blocks development commands.
 
 `sparseVhd=true` in `.wslconfig` applies automatically to newly created VHDs;
 it does not prove that an existing VHDX is sparse. GuardWSL queries the actual
@@ -134,13 +135,14 @@ verified backup.
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+bash tests/install_platform.sh tests/install_order.sh
 cargo audit --deny warnings
 cargo deny check
 bash -n scripts/install-linux.sh scripts/install-shims.sh
 ```
 
 Tests that exercise deletion use isolated temporary directories. They never
-mutate real WSL, Windows, Hyper-V, or project data.
+mutate real Linux, WSL, Windows, Hyper-V, or project data.
 
 See [Architecture](docs/ARCHITECTURE.md),
 [Configuration](docs/CONFIGURATION.md), [Contributing](CONTRIBUTING.md), and

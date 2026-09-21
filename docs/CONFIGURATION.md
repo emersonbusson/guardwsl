@@ -22,6 +22,12 @@ guard config validate
 Edit the TOML file with a normal text editor, then run `guard config validate`.
 Unknown fields and invalid values are rejected.
 
+Older schema-v1 files may still contain `[admission]` and `[memory]` from the
+retired build gate. GuardWSL validates their old shape when reading for safe
+migration, but neither table affects commands or appears in `guard config show`.
+The installer runs `guard config normalize` to remove them while preserving
+active disk, cleanup, and monitor settings.
+
 ## Example
 
 Fresh configuration is generated for the current user. This example uses a
@@ -71,8 +77,7 @@ All sizes are bytes. Thresholds must satisfy:
 emergency < critical < pressure < target
 ```
 
-GuardWSL discovers the backing volume for the current distribution. The
-thresholds classify disk pressure and bound cleanup selection; they never block
+On native Linux GuardWSL probes the filesystem containing `scan_roots`; all roots must be on one filesystem. On WSL2 it discovers the Windows backing volume for the current distribution. The byte thresholds are upper bounds: effective emergency, critical, pressure, and target thresholds are capped at 5%, 10%, 20%, and 30% of observed total capacity respectively. This prevents small disks from remaining permanently in pressure. The thresholds classify disk pressure and bound cleanup selection; they never block
 or queue a development command. No drive letter or VHDX path belongs in this
 configuration.
 
