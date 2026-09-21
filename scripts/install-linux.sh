@@ -134,10 +134,10 @@ trap 'rollback; exit 130' INT TERM
 
 cd "$repo_dir"
 PATH="$real_tool_path" "$cargo_bin" test --locked
+PATH="$real_tool_path" "$cargo_bin" build --release --locked
 if [[ "$old_active" == "active" ]]; then
   systemctl --user stop guardwsl.service
 fi
-PATH="$real_tool_path" "$cargo_bin" build --release --locked
 
 install -m 0755 "$repo_dir/target/release/guard" "$guard_bin"
 install -m 0644 "$repo_dir/systemd/guardwsl.service" "$unit_path"

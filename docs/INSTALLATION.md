@@ -21,11 +21,12 @@ The installer:
 
 1. backs up every managed user file;
 2. runs the Rust tests with GuardWSL shims removed from `PATH`;
-3. builds and installs `~/.local/bin/guard`;
-4. installs the systemd user unit and tool shims;
-7. initializes or strictly normalizes the private configuration;
-8. enables the monitor and waits for `guard doctor` to become healthy;
-9. rolls back all managed files if any activation step fails.
+3. builds the release binary while the existing monitor remains active;
+4. briefly stops the old monitor, then installs `~/.local/bin/guard`, the
+   systemd user unit, and tool shims;
+5. initializes or strictly normalizes the private configuration;
+6. enables the monitor and waits for `guard doctor` to become healthy;
+7. rolls back all managed files if any activation step fails.
 
 Verify the result:
 
