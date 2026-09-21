@@ -12,9 +12,7 @@ const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 #[serde(default, deny_unknown_fields)]
 pub struct GuardConfig {
     pub schema_version: u32,
-    pub admission: AdmissionConfig,
     pub disk: DiskConfig,
-    pub memory: MemoryConfig,
     pub cleanup: CleanupConfig,
     pub monitor: MonitorConfig,
 }
@@ -52,9 +50,7 @@ impl GuardConfig {
             .unwrap_or_default();
         Self {
             schema_version: 1,
-            admission: AdmissionConfig::default(),
             disk: DiskConfig::default(),
-            memory: MemoryConfig::default(),
             cleanup: CleanupConfig {
                 scan_roots,
                 protected_paths,
@@ -68,9 +64,7 @@ impl GuardConfig {
         if self.schema_version != 1 {
             bail!("schema_version must be 1")
         }
-        self.admission.validate()?;
         self.disk.validate()?;
-        self.memory.validate()?;
         self.cleanup.validate()?;
         self.monitor.validate()?;
         Ok(())
@@ -81,6 +75,8 @@ impl GuardConfig {
     }
 }
 
+// Parse-only compatibility for pre-removal schema v1 files. These values have
+// no effect and are not emitted by GuardConfig or shown as active controls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdmissionConfig {
@@ -116,6 +112,14 @@ pub struct DiskConfig {
     pub host_probe_timeout_seconds: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveDiskThresholds {
+    pub emergency_free_bytes: u64,
+    pub critical_free_bytes: u64,
+    pub pressure_free_bytes: u64,
+    pub target_free_bytes: u64,
+}
+
 impl Default for DiskConfig {
     fn default() -> Self {
         Self {
@@ -129,6 +133,28 @@ impl Default for DiskConfig {
 }
 
 impl DiskConfig {
+    #[must_use]
+    pub fn effective_thresholds(&self, volume_total_bytes: u64) -> EffectiveDiskThresholds {
+        fn percent_cap(total: u64, percent: u64) -> u64 {
+            ((u128::from(total) * u128::from(percent)) / 100) as u64
+        }
+
+        EffectiveDiskThresholds {
+            emergency_free_bytes: self
+                .emergency_free_bytes
+                .min(percent_cap(volume_total_bytes, 5)),
+            critical_free_bytes: self
+                .critical_free_bytes
+                .min(percent_cap(volume_total_bytes, 10)),
+            pressure_free_bytes: self
+                .pressure_free_bytes
+                .min(percent_cap(volume_total_bytes, 20)),
+            target_free_bytes: self
+                .target_free_bytes
+                .min(percent_cap(volume_total_bytes, 30)),
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         if self.emergency_free_bytes == 0
             || self.emergency_free_bytes >= self.critical_free_bytes
@@ -396,16 +422,6 @@ impl ConfigStore {
         atomic_write_private(&self.paths.last_known_good, text.as_bytes())?;
         Ok(())
     }
-
-    pub fn set_admission_enabled(&self, enabled: bool) -> Result<LoadedConfig> {
-        let mut loaded = self.load_read_only()?;
-        if loaded.degraded {
-            bail!("configuration is degraded; fix it before changing admission")
-        }
-        loaded.config.admission.enabled = enabled;
-        self.save(&loaded.config)?;
-        self.load_read_only()
-    }
 }
 
 const LEGACY_TABLES: &[&str] = &[
@@ -506,12 +522,9 @@ fn migrate_legacy_config(legacy: LegacyConfig, home: Option<&Path>) -> Result<Gu
     }
 
     let mut config = GuardConfig::default_for_home(home);
-    if let Some(enabled) = workloads.enabled {
-        config.admission.enabled = enabled;
-    }
-    if let Some(host_floor_bytes) = host_memory.host_floor_bytes {
-        config.memory.host_floor_bytes = host_floor_bytes;
-    }
+    // Parse retired legacy fields for type safety, but never activate them.
+    let _ = workloads.enabled;
+    let _ = host_memory.host_floor_bytes;
     if let Some(interval_seconds) = intervals.monitor_seconds {
         config.monitor.interval_seconds = interval_seconds;
     }
@@ -582,7 +595,23 @@ fn parse_config_text(text: &str, home: Option<&Path>) -> Result<GuardConfig> {
             .context("legacy version=1 configuration is invalid")?;
         migrate_legacy_config(legacy, home)?
     } else {
-        document
+        let mut current = document;
+        let table = current
+            .as_table_mut()
+            .context("the configuration root must be a TOML table")?;
+        if let Some(retired) = table.remove("admission") {
+            let old: AdmissionConfig = retired
+                .try_into()
+                .context("retired admission configuration is invalid")?;
+            old.validate()?;
+        }
+        if let Some(retired) = table.remove("memory") {
+            let old: MemoryConfig = retired
+                .try_into()
+                .context("retired memory configuration is invalid")?;
+            old.validate()?;
+        }
+        current
             .try_into()
             .context("schema_version=1 configuration is invalid")?
     };
@@ -615,9 +644,8 @@ mod tests {
     }
 
     #[test]
-    fn defaults_disable_build_admission_while_preserving_cleanup() {
+    fn defaults_preserve_cleanup_without_retired_build_policy() {
         let config = test_default();
-        assert!(!config.admission.enabled);
         assert!(config.cleanup.enabled);
         assert_eq!(
             config.cleanup.scan_roots,
@@ -629,7 +657,8 @@ mod tests {
                 .protected_paths
                 .contains(&PathBuf::from("/home/guard-test/.ssh"))
         );
-        assert_eq!(config.memory.host_floor_bytes, 8 * GIB);
+        assert!(!config.to_toml().unwrap().contains("[admission]"));
+        assert!(!config.to_toml().unwrap().contains("[memory]"));
         assert!(config.disk.emergency_free_bytes < config.disk.critical_free_bytes);
         assert!(config.disk.critical_free_bytes < config.disk.pressure_free_bytes);
         assert!(config.disk.pressure_free_bytes < config.disk.target_free_bytes);
@@ -675,25 +704,38 @@ cache_min_age_hours = 48
     }
 
     #[test]
-    fn admission_toggle_persists_without_touching_cleanup() {
+    fn retired_policy_normalization_preserves_cleanup_settings() {
         let (_directory, store) = store();
-        store.save(&test_default()).unwrap();
-        let off = store.set_admission_enabled(false).unwrap();
-        assert!(!off.config.admission.enabled);
-        assert!(off.config.cleanup.enabled);
-        let on = store.set_admission_enabled(true).unwrap();
-        assert!(on.config.admission.enabled);
+        let mut old = test_default().to_toml().unwrap();
+        old.push_str("\n[admission]\nenabled = true\nbuild_wait_seconds = 7200\n");
+        old.push_str("\n[memory]\nhost_floor_bytes = 10737418240\n");
+        old.push_str("build_headroom_bytes = 1073741824\n");
+        atomic_write_private(&store.paths.user, old.as_bytes()).unwrap();
+
+        let loaded = store.load_read_only().unwrap();
+        assert!(!loaded.degraded);
+        assert!(loaded.config.cleanup.enabled);
+        assert_eq!(
+            loaded.config.cleanup.scan_roots,
+            test_default().cleanup.scan_roots
+        );
+        store.save(&loaded.config).unwrap();
+
+        let normalized = std::fs::read_to_string(&store.paths.user).unwrap();
+        assert!(!normalized.contains("[admission]"));
+        assert!(!normalized.contains("[memory]"));
+        assert_eq!(store.load_read_only().unwrap().config, loaded.config);
     }
 
     #[test]
-    fn invalid_active_config_uses_last_known_good_and_blocks_mutation() {
+    fn invalid_active_config_uses_last_known_good_without_rewriting_active() {
         let (_directory, store) = store();
         store.save(&test_default()).unwrap();
         std::fs::write(&store.paths.user, b"not = [valid").unwrap();
         let loaded = store.load_read_only().unwrap();
         assert!(loaded.degraded);
         assert_eq!(loaded.origin, ConfigOrigin::LastKnownGood);
-        assert!(store.set_admission_enabled(false).is_err());
+        assert_eq!(std::fs::read(&store.paths.user).unwrap(), b"not = [valid");
     }
 
     #[test]
@@ -780,8 +822,8 @@ enabled = true
 
         let config = parse_config_text(legacy, Some(Path::new("/home/guard-test"))).unwrap();
         assert_eq!(config.schema_version, 1);
-        assert!(!config.admission.enabled);
-        assert_eq!(config.memory.host_floor_bytes, 10 * GIB);
+        assert!(!config.to_toml().unwrap().contains("[admission]"));
+        assert!(!config.to_toml().unwrap().contains("[memory]"));
         assert_eq!(config.monitor.interval_seconds, 45);
         assert_eq!(config.monitor.maintenance_interval_seconds, 7200);
         assert_eq!(config.cleanup.cache_min_age_hours, 48);

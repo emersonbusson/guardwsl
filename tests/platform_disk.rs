@@ -37,6 +37,12 @@ fn tiny_disks_are_not_permanently_in_emergency() {
     let total = 5 * GIB;
     let thresholds = config.effective_thresholds(total);
     assert!(thresholds.target_free_bytes < total);
-    assert_eq!(classify_disk(2 * GIB, total, &config), DiskPressure::Healthy);
-    assert_eq!(classify_disk(200 * 1024 * 1024, total, &config), DiskPressure::Emergency);
+    assert_eq!(
+        classify_disk(2 * GIB, total, &config),
+        DiskPressure::Healthy
+    );
+    assert_eq!(
+        classify_disk(200 * 1024 * 1024, total, &config),
+        DiskPressure::Emergency
+    );
 }

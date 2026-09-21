@@ -1,8 +1,8 @@
 # Architecture
 
-GuardWSL is a user-scoped WSL2 utility with three responsibilities:
+GuardWSL is a user-scoped native Linux and WSL2 utility with three responsibilities:
 
-1. observe physical Windows disk and RAM headroom;
+1. observe host-disk pressure (local Linux filesystem or WSL2 backing Windows volume);
 2. plan and execute allowlisted cleanup;
 3. run a small systemd user monitor.
 
@@ -11,7 +11,7 @@ GuardWSL is a user-scoped WSL2 utility with three responsibilities:
 | Component | Responsibility |
 | --- | --- |
 | `maintenance_lock` | Serializes cleanup activity. |
-| `host` | Runs a bounded, read-only PowerShell host probe. |
+| `host` | Selects a local `statvfs` probe on native Linux or a bounded, read-only PowerShell backing-volume probe on WSL2. |
 | `repository` | Discovers authenticated Git repositories under configured roots. |
 | `cleanup` | Plans, revalidates, quarantines, and removes exact allowlist entries. |
 | `history` | Appends private JSONL audit records. |
@@ -31,8 +31,9 @@ monitor -> fresh host probe -> pressure classification
 
 ## Trust boundaries
 
-- Windows data is observational. The PowerShell adapter reads memory, registry,
-  volume, process, and VHD sparse state with a bounded timeout; it does not
+- Native Linux pressure uses available space on the filesystem containing the configured scan roots; cross-filesystem roots fail closed. WSL2 pressure uses the physical Windows backing volume, never guest virtual `df` capacity.
+- Windows data is observational. The PowerShell adapter reads registry,
+  volume, and VHD sparse state with a bounded timeout; it does not
   mutate Windows or WSL state.
 - Linux cleanup runs as the current user and cannot intentionally cross its
   authenticated roots, devices, mounts, protected paths, or ownership boundary.

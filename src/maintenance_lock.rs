@@ -1,4 +1,4 @@
-//! Short exclusion between cleanup and heavy builds to preserve in-use artifacts.
+//! Exclusive lock between cleanup cycles; development commands never use it.
 
 use crate::fsutil::{effective_uid, flock_file};
 use anyhow::{Context, Result, bail};
@@ -19,20 +19,12 @@ impl MaintenanceLock {
         Self::acquire_at(&default_lock_path(), timeout)
     }
 
-    pub fn acquire_shared(timeout: Duration) -> Result<Self> {
-        Self::acquire_shared_at(&default_lock_path(), timeout)
-    }
-
     pub fn try_acquire() -> Result<Option<Self>> {
         Self::try_acquire_at(&default_lock_path())
     }
 
     pub fn acquire_at(path: &Path, timeout: Duration) -> Result<Self> {
         Self::acquire_at_operation(path, timeout, libc::LOCK_EX)
-    }
-
-    pub fn acquire_shared_at(path: &Path, timeout: Duration) -> Result<Self> {
-        Self::acquire_at_operation(path, timeout, libc::LOCK_SH)
     }
 
     fn acquire_at_operation(
@@ -46,7 +38,7 @@ impl MaintenanceLock {
                 return Ok(lock);
             }
             if started.elapsed() >= timeout {
-                bail!("another maintenance task or heavy build is still active after {timeout:?}")
+                bail!("another maintenance task is still active after {timeout:?}")
             }
             thread::sleep(Duration::from_millis(100));
         }
@@ -139,20 +131,6 @@ mod tests {
         let first = MaintenanceLock::acquire_at(&path, Duration::from_millis(20)).unwrap();
         assert!(MaintenanceLock::try_acquire_at(&path).unwrap().is_none());
         drop(first);
-        assert!(MaintenanceLock::try_acquire_at(&path).unwrap().is_some());
-    }
-
-    #[test]
-    fn shared_build_holders_coexist_but_exclude_cleanup() {
-        let directory = tempdir().unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let path = directory.path().join("maintenance.lock");
-        let first = MaintenanceLock::acquire_shared_at(&path, Duration::from_millis(20)).unwrap();
-        let second = MaintenanceLock::acquire_shared_at(&path, Duration::from_millis(20)).unwrap();
-        assert!(MaintenanceLock::try_acquire_at(&path).unwrap().is_none());
-        drop(first);
-        assert!(MaintenanceLock::try_acquire_at(&path).unwrap().is_none());
-        drop(second);
         assert!(MaintenanceLock::try_acquire_at(&path).unwrap().is_some());
     }
 
