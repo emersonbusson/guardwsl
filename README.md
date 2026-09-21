@@ -11,7 +11,7 @@ The design is deliberately conservative: uncertainty preserves data.
 
 ## Status
 
-The current source version is `0.1.0`. Its 50 Rust tests, formatter, Clippy,
+The current source version is `0.1.0`. Its Rust tests, formatter, Clippy,
 shell syntax, dependency audit, and dependency-policy checks pass locally. No
 stable public release has been published yet; review a dry run before enabling
 real cleanup on any machine.
