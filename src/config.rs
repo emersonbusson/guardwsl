@@ -644,6 +644,37 @@ mod tests {
     }
 
     #[test]
+    fn retired_build_policy_is_read_but_not_reemitted() {
+        let old = r#"
+schema_version = 1
+
+[admission]
+enabled = true
+build_wait_seconds = 7200
+
+[memory]
+host_floor_bytes = 10737418240
+build_headroom_bytes = 1073741824
+
+[cleanup]
+scan_roots = ["/home/guard-test"]
+cache_min_age_hours = 48
+"#;
+        let config = parse_config_text(old, Some(Path::new("/home/guard-test"))).unwrap();
+        assert!(config.cleanup.enabled);
+        assert_eq!(config.cleanup.cache_min_age_hours, 48);
+        let normalized = config.to_toml().unwrap();
+        assert!(!normalized.contains("[admission]"));
+        assert!(!normalized.contains("[memory]"));
+    }
+
+    #[test]
+    fn malformed_retired_build_policy_remains_invalid() {
+        let invalid = "schema_version = 1\n[admission]\nbuild_wait_seconds = 0\n";
+        assert!(parse_config_text(invalid, Some(Path::new("/home/guard-test"))).is_err());
+    }
+
+    #[test]
     fn admission_toggle_persists_without_touching_cleanup() {
         let (_directory, store) = store();
         store.save(&test_default()).unwrap();
