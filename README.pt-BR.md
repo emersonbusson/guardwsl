@@ -13,14 +13,18 @@ O desenho é deliberadamente conservador: na dúvida, os dados são preservados.
 
 ## Status
 
-A versão atual do código é `0.1.0`. Seus testes Rust, formatter, Clippy,
-sintaxe shell, auditoria de dependências e política de dependências passam
-localmente. Ainda não há uma versão pública estável; revise um dry-run antes de
-ativar limpeza real em qualquer máquina.
+A versão atual do código é `0.1.1`. `guard --version` mostra o SHA completo
+do código-fonte. O texto de `guard status` mantém versão e SHA curto; o JSON
+inclui o SHA completo e os dados de instalação. Ainda não há uma versão
+pública estável; revise um dry-run antes de ativar limpeza real em qualquer
+máquina.
 
 ## O que a v1 faz
 
-1. `guard status` mostra a pressão no disco do host e a saúde do monitor. No WSL2 também mostra o caminho e atributo sparse do VHDX atual.
+1. `guard status` mostra a versão do GuardWSL, o SHA curto, a data da
+   instalação, a pressão no disco do host e a saúde do monitor. O JSON inclui o
+   SHA completo. No WSL2 também mostra o caminho e atributo sparse do VHDX
+   atual.
 2. Um monitor systemd de usuário executa manutenção por idade e reage à pressão
    no disco do host.
 3. Uma allowlist exata permite limpar somente caches e artefatos conhecidos

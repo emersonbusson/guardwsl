@@ -10,7 +10,8 @@ The v1 allowlist is limited to:
 - npm, Yarn, pnpm, Cargo, and Go caches;
 - Rust `target` directories;
 - `.next`, `.turbo`, `.vite`, `.pytest_cache`, `.mypy_cache`, and `.ruff_cache`;
-- `node_modules` with a recognized lockfile.
+- `node_modules` with a recognized lockfile in the project directory or the
+  Git repository root.
 
 Generic `dist`, `build`, and `out` directories are never candidates. Source,
 Git data, configuration, secrets, databases, uploads, media, Docker data, and
@@ -23,9 +24,12 @@ A project candidate is removable only when every applicable invariant passes:
 1. the scan root and repository are canonical, current-user-owned directories;
 2. the candidate is a real directory, not a symlink or mount escape;
 3. it is on the same filesystem as its authenticated parent;
-4. its exact category, manifest, lockfile, and age requirements pass;
+4. its exact category, manifest, lockfile, and age requirements pass; a
+   lockfile may sit in the project directory or anywhere up to the repository
+   root (monorepo workspace);
 5. Git reports it ignored and reports no tracked path inside it;
-6. it contains no nested mount, special file, or hard link;
+6. it contains no nested mount, special file, or hard link whose other name
+   lies outside the candidate tree;
 7. no same-user process references it through cwd, root, executable, maps, or
    open file descriptors;
 8. identity, inode, device, and newest modification time still match the plan;

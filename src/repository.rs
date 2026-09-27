@@ -1,6 +1,6 @@
 //! Bounded repository discovery under explicit roots.
 
-use crate::fsutil::effective_uid;
+use crate::fsutil::is_unsafe_dir_owner_mode;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
@@ -87,7 +87,11 @@ fn authenticate_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 bail!("unsafe scan root: {}", root.display())
             }
             #[cfg(target_os = "linux")]
-            if metadata.uid() != effective_uid() || metadata.permissions().mode() & 0o022 != 0 {
+            if is_unsafe_dir_owner_mode(
+                metadata.uid(),
+                metadata.gid(),
+                metadata.permissions().mode(),
+            ) {
                 bail!("unsafe owner or mode on scan root: {}", root.display())
             }
             let canonical = std::fs::canonicalize(root)?;
