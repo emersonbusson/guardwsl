@@ -25,6 +25,5 @@ and the project intends to use [Semantic Versioning](https://semver.org/).
 - Cleanup recognizes lockfiles from monorepo project directories through the
   repository root and permits hard links only when every name is inside the
   candidate tree.
-- Group-writable cleanup roots are accepted only when owned by the current
-  user and group-writable by the effective group; other-writable roots remain
-  rejected.
+- Group- and other-writable cleanup roots are rejected to prevent concurrent
+  changes by peers during cleanup.

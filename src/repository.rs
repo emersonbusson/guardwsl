@@ -87,11 +87,7 @@ fn authenticate_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 bail!("unsafe scan root: {}", root.display())
             }
             #[cfg(target_os = "linux")]
-            if is_unsafe_dir_owner_mode(
-                metadata.uid(),
-                metadata.gid(),
-                metadata.permissions().mode(),
-            ) {
+            if is_unsafe_dir_owner_mode(metadata.uid(), metadata.permissions().mode()) {
                 bail!("unsafe owner or mode on scan root: {}", root.display())
             }
             let canonical = std::fs::canonicalize(root)?;

@@ -22,6 +22,7 @@ unknown paths are always preserved.
 A project candidate is removable only when every applicable invariant passes:
 
 1. the scan root and repository are canonical, current-user-owned directories;
+   group- and other-writable roots and candidate parents are rejected;
 2. the candidate is a real directory, not a symlink or mount escape;
 3. it is on the same filesystem as its authenticated parent;
 4. its exact category, manifest, lockfile, and age requirements pass; a
