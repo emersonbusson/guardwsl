@@ -29,8 +29,8 @@ project's first stable release.
 - The Windows probe is read-only and bounded by a timeout and output limit.
 - Cleanup is exact-allowlist, revalidates identity, and preserves data whenever
   evidence is incomplete.
-- The build gate is cooperative and can be bypassed by deliberately avoiding
-  GuardWSL shims.
+- Development commands are forwarded directly; GuardWSL does not gate or
+  control their execution.
 - GuardWSL does not compact or convert VHDX files and does not start, stop, or
   control WSL or Hyper-V resources.
 
