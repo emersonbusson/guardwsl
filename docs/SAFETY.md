@@ -60,4 +60,5 @@ immediately returns a physical byte to the host volume.
 
 GuardWSL does not compact or convert VHDX files, shut down WSL, drop caches,
 prune Docker, control Hyper-V, manage cgroups, or provide a privileged broker.
-It cannot protect commands that deliberately bypass its cooperative shims.
+Development commands are forwarded directly, so GuardWSL is not an execution
+sandbox or command-policy gate.

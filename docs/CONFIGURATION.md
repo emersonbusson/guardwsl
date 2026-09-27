@@ -22,11 +22,20 @@ guard config validate
 Edit the TOML file with a normal text editor, then run `guard config validate`.
 Unknown fields and invalid values are rejected.
 
-Older schema-v1 files may still contain `[admission]` and `[memory]` from the
+Current-schema files may still contain `[admission]` and `[memory]` from the
 retired build gate. GuardWSL validates their old shape when reading for safe
 migration, but neither table affects commands or appears in `guard config show`.
-The installer runs `guard config normalize` to remove them while preserving
-active disk, cleanup, and monitor settings.
+`guard config normalize` removes these tables while preserving active disk,
+cleanup, and monitor settings.
+
+Older legacy files using `version = 1` may also contain tables such as
+`[scan]`, `[categories]`, `[intervals]`, `[reserve]`, `[workloads]`,
+`[host_memory]`, and `[archive]`. Normalization carries forward supported
+cleanup ages, protected paths, and monitor intervals, then writes only the
+current schema. Legacy scan roots use the current default; reserve, workload,
+host-memory, and archive controls are not activated. GuardWSL v0.1.1 does not
+create or manage a `reserve.bin` file, and configuration normalization never
+deletes files. The installer runs `guard config normalize` on the active config.
 
 ## Example
 
