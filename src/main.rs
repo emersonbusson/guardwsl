@@ -23,7 +23,18 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Parser)]
 #[command(
     name = "guard",
-    version,
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (commit ",
+        env!("GUARD_GIT_COMMIT"),
+        ")"
+    ),
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (commit ",
+        env!("GUARD_GIT_COMMIT"),
+        ")"
+    ),
     about = "Safe cache cleanup and host-disk pressure monitoring for Linux and WSL2"
 )]
 struct Cli {
@@ -140,6 +151,7 @@ fn status(args: OutputArgs) -> Result<i32> {
     let host = probe_host(&config);
     let monitor = read_monitor_status(&config);
     let last_cleanup = read_cleanup_cycle();
+    let installation = read_install_metadata();
     let monitor_report = monitor.as_ref().and_then(|status| {
         serde_json::to_value(status).ok().map(|mut value| {
             value["healthy"] = json!(status.healthy(&config));
@@ -156,6 +168,12 @@ fn status(args: OutputArgs) -> Result<i32> {
     let report = json!({
         "service": "guardwsl",
         "version": env!("CARGO_PKG_VERSION"),
+        "commit": env!("GUARD_GIT_COMMIT"),
+        "commit_short": env!("GUARD_GIT_COMMIT_SHORT"),
+        "installed_at": installation.as_ref().map(|value| value.installed_at.as_str()),
+        "installed_version": installation.as_ref().and_then(|value| value.version.as_deref()),
+        "installed_commit": installation.as_ref().and_then(|value| value.commit.as_deref()),
+        "installed_commit_short": installation.as_ref().and_then(|value| value.commit_short.as_deref()),
         "configured": {
             "ok": loaded.is_ok(),
             "origin": loaded.as_ref().ok().map(|value| value.origin),
@@ -213,6 +231,17 @@ fn print_status(report: &Value) {
         } else {
             "failed"
         }
+    );
+    println!(
+        "Version: {} (commit {})",
+        report["version"].as_str().unwrap_or("unknown"),
+        report["commit_short"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "Installed: {}",
+        report["installed_at"]
+            .as_str()
+            .unwrap_or("unknown (installation record missing or invalid)")
     );
     if let Some(host) = report["host"].as_object() {
         println!(
@@ -817,6 +846,23 @@ fn monitor(args: MonitorArgs) -> Result<i32> {
 fn read_monitor_status(_config: &GuardConfig) -> Option<MonitorStatus> {
     let path = default_state_dir().ok()?.join("monitor-status.json");
     let bytes = read_private(&path, 256 * 1024).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallMetadata {
+    installed_at: String,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
+    commit_short: Option<String>,
+}
+
+fn read_install_metadata() -> Option<InstallMetadata> {
+    let path = default_state_dir().ok()?.join("install.json");
+    let bytes = read_private(&path, 64 * 1024).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 

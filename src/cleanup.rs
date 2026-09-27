@@ -4,13 +4,14 @@
 //! Docker volumes, and unknown paths are never candidates.
 
 use crate::config::GuardConfig;
-use crate::fsutil::effective_uid;
+use crate::fsutil::{effective_uid, is_unsafe_dir_owner_mode};
 use crate::history::{AuditLog, AuditOutcome, AuditRecord};
 use crate::host::DiskPressure;
 use crate::repository::{Repository, discover_repositories};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
 use std::io;
@@ -393,7 +394,7 @@ fn add_repository_candidates(
                 age_for(config, pressure, config.cleanup.build_min_age_hours),
                 plan,
             );
-            if has_lockfile(&project) {
+            if find_lockfile(&project, Some(&repository.root)) {
                 push_candidate(
                     config,
                     project.join("node_modules"),
@@ -465,7 +466,7 @@ fn is_guard_quarantine_path(path: &Path) -> bool {
     })
 }
 
-fn has_lockfile(project: &Path) -> bool {
+fn dir_has_lockfile(dir: &Path) -> bool {
     [
         "package-lock.json",
         "npm-shrinkwrap.json",
@@ -475,9 +476,27 @@ fn has_lockfile(project: &Path) -> bool {
         "bun.lockb",
     ]
     .iter()
-    .filter(|name| regular_file(&project.join(name)))
-    .count()
-        == 1
+    .any(|name| regular_file(&dir.join(name)))
+}
+
+fn find_lockfile(project: &Path, repository: Option<&Path>) -> bool {
+    if dir_has_lockfile(project) {
+        return true;
+    }
+    let Some(repo) = repository else {
+        return false;
+    };
+    let mut dir = project.parent();
+    while let Some(current) = dir {
+        if current == repo || !current.starts_with(repo) {
+            break;
+        }
+        if dir_has_lockfile(current) {
+            return true;
+        }
+        dir = current.parent();
+    }
+    dir_has_lockfile(repo)
 }
 
 fn age_for(config: &GuardConfig, pressure: DiskPressure, normal: u64) -> u64 {
@@ -520,15 +539,18 @@ fn inspect_candidate(
         bail!("candidate is not a real directory")
     }
     #[cfg(target_os = "linux")]
-    if metadata.uid() != effective_uid() || metadata.mode() & 0o022 != 0 {
+    if is_unsafe_dir_owner_mode(metadata.uid(), metadata.gid(), metadata.mode()) {
         bail!("candidate is not a private root owned by the current user")
     }
     let parent = path.parent().context("candidate has no parent directory")?;
     let parent_metadata = fs::symlink_metadata(parent)?;
     #[cfg(target_os = "linux")]
     if parent_metadata.file_type().is_symlink()
-        || parent_metadata.uid() != effective_uid()
-        || parent_metadata.mode() & 0o022 != 0
+        || is_unsafe_dir_owner_mode(
+            parent_metadata.uid(),
+            parent_metadata.gid(),
+            parent_metadata.mode(),
+        )
     {
         bail!("candidate parent directory has an unsafe owner or mode")
     }
@@ -622,16 +644,22 @@ fn validate_context(path: &Path, kind: CleanupKind, repository: Option<&Path>) -
         }
         CleanupKind::NextBuild => {
             let parent = path.parent().context(".next has no parent directory")?;
-            if !regular_file(&parent.join("package.json")) || !has_lockfile(parent) {
+            if !regular_file(&parent.join("package.json")) {
                 bail!(".next has no sibling package.json")
+            }
+            if !find_lockfile(parent, repository) {
+                bail!(".next has no lockfile in the project directory or repository root")
             }
         }
         CleanupKind::NodeModules => {
             let parent = path
                 .parent()
                 .context("node_modules has no parent directory")?;
-            if !regular_file(&parent.join("package.json")) || !has_lockfile(parent) {
-                bail!("node_modules has no manifest and lockfile")
+            if !regular_file(&parent.join("package.json")) {
+                bail!("node_modules has no sibling package.json")
+            }
+            if !find_lockfile(parent, repository) {
+                bail!("node_modules has no lockfile in the project directory or repository root")
             }
         }
         CleanupKind::ProjectCache => {
@@ -698,11 +726,18 @@ fn git_status<const N: usize>(repository: &Path, args: [&str; N]) -> Result<i32>
     }
 }
 
+#[derive(Debug)]
 struct TreeProfile {
     bytes: u64,
     newest_modified: SystemTime,
     device: u64,
     inode: u64,
+}
+
+struct HardLinkTally {
+    nlink: u64,
+    names_inside: usize,
+    sample: PathBuf,
 }
 
 fn profile_tree(path: &Path) -> Result<TreeProfile> {
@@ -714,6 +749,7 @@ fn profile_tree(path: &Path) -> Result<TreeProfile> {
     let mut bytes = 0_u64;
     let mut newest = root.modified()?;
     let mounts = mount_points()?;
+    let mut hard_links: HashMap<(u64, u64), HardLinkTally> = HashMap::new();
     for (index, entry) in WalkDir::new(path)
         .follow_links(false)
         .into_iter()
@@ -737,7 +773,18 @@ fn profile_tree(path: &Path) -> Result<TreeProfile> {
         }
         #[cfg(target_os = "linux")]
         if metadata.is_file() && metadata.nlink() > 1 {
-            bail!("candidate contains a hard link at {}", entry_path.display())
+            let key = (metadata.dev(), metadata.ino());
+            hard_links
+                .entry(key)
+                .and_modify(|tally| {
+                    tally.nlink = tally.nlink.max(metadata.nlink());
+                    tally.names_inside += 1;
+                })
+                .or_insert_with(|| HardLinkTally {
+                    nlink: metadata.nlink(),
+                    names_inside: 1,
+                    sample: entry_path.to_path_buf(),
+                });
         }
         if !metadata.is_dir() && !metadata.is_file() && !metadata.file_type().is_symlink() {
             bail!(
@@ -748,6 +795,14 @@ fn profile_tree(path: &Path) -> Result<TreeProfile> {
         bytes = bytes.saturating_add(metadata.len());
         if let Ok(modified) = metadata.modified() {
             newest = newest.max(modified);
+        }
+    }
+    for tally in hard_links.values() {
+        if tally.names_inside < tally.nlink as usize {
+            bail!(
+                "candidate contains a hard link with a name outside the tree at {}",
+                tally.sample.display()
+            )
         }
     }
     Ok(TreeProfile {
@@ -1276,5 +1331,254 @@ mod tests {
         };
         assert!(report.succeeded());
         assert_eq!(report.deleted_logical_bytes, GIB);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn internal_hard_links_inside_tree_are_deletable() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("target");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(path.join("artifact"), b"content").unwrap();
+        fs::hard_link(path.join("artifact"), path.join("artifact-link")).unwrap();
+        age(&path.join("artifact"));
+        age(&path);
+
+        let profile = profile_tree(&path).unwrap();
+        assert!(profile.bytes > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_hard_link_refuses_tree() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("target");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(path.join("artifact"), b"content").unwrap();
+        let outside = directory.path().join("outside-link");
+        fs::hard_link(path.join("artifact"), &outside).unwrap();
+        age(&path.join("artifact"));
+        age(&path);
+
+        let error = profile_tree(&path).unwrap_err();
+        assert!(error.to_string().contains("hard link"));
+        assert!(error.to_string().contains("outside"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dual_lockfiles_still_prove_reproducibility() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let repo = fs::canonicalize(directory.path()).unwrap();
+        Command::new("git")
+            .args(["-c", "safe.directory=*", "init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        fs::write(repo.join(".gitignore"), b"/node_modules\n").unwrap();
+        fs::write(repo.join("package.json"), b"{}").unwrap();
+        fs::write(repo.join("package-lock.json"), b"{}").unwrap();
+        fs::write(repo.join("yarn.lock"), b"").unwrap();
+        fs::create_dir(repo.join("node_modules")).unwrap();
+        fs::set_permissions(repo.join("node_modules"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(repo.join("node_modules/x"), b"x").unwrap();
+        age(&repo.join("node_modules/x"));
+        age(&repo.join("node_modules"));
+        let mut config = GuardConfig::default();
+        config.cleanup.protected_paths.clear();
+        config.cleanup.scan_roots = vec![repo.clone()];
+        let plan = plan_cleanup(&config, DiskPressure::Healthy).unwrap();
+        assert!(
+            plan.candidates
+                .iter()
+                .any(|item| item.path == repo.join("node_modules")),
+            "dual lockfiles should still allow node_modules. skips: {:?}",
+            plan.skips
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_lockfile_still_refuses_node_modules() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let repo = fs::canonicalize(directory.path()).unwrap();
+        Command::new("git")
+            .args(["-c", "safe.directory=*", "init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        fs::write(repo.join(".gitignore"), b"/node_modules\n").unwrap();
+        fs::write(repo.join("package.json"), b"{}").unwrap();
+        fs::create_dir(repo.join("node_modules")).unwrap();
+        fs::set_permissions(repo.join("node_modules"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(repo.join("node_modules/x"), b"x").unwrap();
+        age(&repo.join("node_modules/x"));
+        age(&repo.join("node_modules"));
+        let mut config = GuardConfig::default();
+        config.cleanup.protected_paths.clear();
+        config.cleanup.scan_roots = vec![repo.clone()];
+        let plan = plan_cleanup(&config, DiskPressure::Healthy).unwrap();
+        assert!(
+            !plan
+                .candidates
+                .iter()
+                .any(|item| item.path == repo.join("node_modules")),
+            "node_modules without any lockfile must be refused"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn monorepo_root_lockfile_unlocks_nested_node_modules() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let repo = fs::canonicalize(directory.path()).unwrap();
+        Command::new("git")
+            .args(["-c", "safe.directory=*", "init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        fs::write(
+            repo.join(".gitignore"),
+            b"/apps/web/node_modules\n/apps/web/.next\n",
+        )
+        .unwrap();
+        fs::write(repo.join("package.json"), b"{}").unwrap();
+        fs::write(repo.join("yarn.lock"), b"").unwrap();
+        let app = repo.join("apps/web");
+        fs::create_dir_all(&app).unwrap();
+        fs::set_permissions(&app, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(app.join("package.json"), b"{}").unwrap();
+        fs::create_dir(app.join("node_modules")).unwrap();
+        fs::set_permissions(app.join("node_modules"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(app.join("node_modules/x"), b"x").unwrap();
+        age(&app.join("node_modules/x"));
+        age(&app.join("node_modules"));
+        let mut config = GuardConfig::default();
+        config.cleanup.protected_paths.clear();
+        config.cleanup.scan_roots = vec![repo.clone()];
+        let plan = plan_cleanup(&config, DiskPressure::Healthy).unwrap();
+        assert!(
+            plan.candidates
+                .iter()
+                .any(|item| item.path == app.join("node_modules")),
+            "monorepo root lockfile should unlock nested node_modules. skips: {:?}",
+            plan.skips
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ancestor_walk_stops_at_repository_root() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let outer = directory.path().join("outer");
+        fs::create_dir(&outer).unwrap();
+        fs::set_permissions(&outer, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(outer.join("yarn.lock"), b"").unwrap();
+        let repo = outer.join("repo");
+        fs::create_dir(&repo).unwrap();
+        fs::set_permissions(&repo, fs::Permissions::from_mode(0o700)).unwrap();
+        let project = repo.join("app");
+        fs::create_dir(&project).unwrap();
+        assert!(!find_lockfile(&project, Some(&repo)));
+    }
+
+    #[test]
+    fn missing_lockfile_without_git_only_checks_parent() {
+        let directory = tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = directory.path().join("app");
+        fs::create_dir(&parent).unwrap();
+        #[cfg(target_os = "linux")]
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(directory.path().join("yarn.lock"), b"").unwrap();
+        assert!(!find_lockfile(&parent, None));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn skip_reason_distinguishes_manifest_and_lockfile() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let repo = fs::canonicalize(directory.path()).unwrap();
+        Command::new("git")
+            .args(["-c", "safe.directory=*", "init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        fs::write(repo.join(".gitignore"), b"/node_modules\n").unwrap();
+        fs::create_dir(repo.join("node_modules")).unwrap();
+        fs::set_permissions(repo.join("node_modules"), fs::Permissions::from_mode(0o700)).unwrap();
+        let config = GuardConfig::default();
+        let error = validate_context(
+            &repo.join("node_modules"),
+            CleanupKind::NodeModules,
+            Some(&repo),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("package.json"));
+
+        fs::write(repo.join("package.json"), b"{}").unwrap();
+        let error = validate_context(
+            &repo.join("node_modules"),
+            CleanupKind::NodeModules,
+            Some(&repo),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("lockfile"));
+        let _ = config;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_writable_primary_gid_parent_is_accepted() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = directory.path().join("project");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o775)).unwrap();
+        let candidate = parent.join("cache");
+        fs::create_dir(&candidate).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(candidate.join("x"), b"x").unwrap();
+        age(&candidate.join("x"));
+        age(&candidate);
+        let mut config = GuardConfig::default();
+        config.cleanup.protected_paths.clear();
+        let result = inspect_candidate(&config, &candidate, CleanupKind::JavaScriptCache, None, 1);
+        assert!(
+            result.is_ok(),
+            "group-writable parent with primary gid should pass: {:?}",
+            result.err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn other_writable_parent_still_rejected() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = directory.path().join("project");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let candidate = parent.join("cache");
+        fs::create_dir(&candidate).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(candidate.join("x"), b"x").unwrap();
+        age(&candidate.join("x"));
+        age(&candidate);
+        let mut config = GuardConfig::default();
+        config.cleanup.protected_paths.clear();
+        let error = inspect_candidate(&config, &candidate, CleanupKind::JavaScriptCache, None, 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("unsafe owner or mode"));
     }
 }

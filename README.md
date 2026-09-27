@@ -11,14 +11,18 @@ The design is deliberately conservative: uncertainty preserves data.
 
 ## Status
 
-The current source version is `0.1.0`. Its Rust tests, formatter, Clippy,
-shell syntax, dependency audit, and dependency-policy checks pass locally. No
-stable public release has been published yet; review a dry run before enabling
-real cleanup on any machine.
+The current source version is `0.1.1`. `guard --version` reports the full
+source commit. `guard status` shows a compact version and short commit in text;
+its JSON report includes full commit and installation identity. No stable
+public release has been published yet; review a dry run before enabling real
+cleanup on any machine.
 
 ## What v1 does
 
-1. `guard status` reports host-disk pressure and monitor health. On WSL2 it also reports the current VHDX location and sparse attribute.
+1. `guard status` reports the GuardWSL version, short source commit, install
+   date, host-disk pressure, and monitor health. Its JSON report includes the
+   full commit. On WSL2 it also reports the current VHDX location and sparse
+   attribute.
 2. A systemd user monitor performs age-based maintenance and reacts to physical
    host-disk pressure.
 3. An exact allowlist permits cleanup of known caches and build artifacts only
