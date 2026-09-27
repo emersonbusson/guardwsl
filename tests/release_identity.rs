@@ -36,6 +36,14 @@ fn state_home_with_install_record(commit: Option<&str>) -> TempDir {
 
 #[test]
 fn version_output_includes_the_source_commit() {
+    let source_commit = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8(output.stdout).unwrap().trim().to_owned());
+
     for args in [&["--version"][..], &["-V"][..]] {
         let output = guard(args, None);
         assert!(output.status.success());
@@ -45,11 +53,16 @@ fn version_output_includes_the_source_commit() {
             .split_once(" (commit ")
             .and_then(|(_, value)| value.strip_suffix(')'))
             .expect("version output should include a commit SHA");
+        if let Some(source_commit) = &source_commit {
+            assert_eq!(commit, source_commit);
+        } else {
+            assert_eq!(commit, "unknown");
+        }
         assert!(
-            commit.len() >= 40,
-            "version output should include the complete Git commit SHA"
+            commit == "unknown" || commit.len() >= 40,
+            "version output should include the complete Git commit SHA when available"
         );
-        assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(commit == "unknown" || commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 }
 
