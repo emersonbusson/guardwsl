@@ -15,6 +15,7 @@ distro_path="$state_root/distro-name"
 environment_path="$HOME/.config/environment.d/20-guardwsl.conf"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 backup_root="$state_root/install-backups/$timestamp"
+install_record_tmp=""
 cargo_bin="$HOME/.cargo/bin/cargo"
 distro_name="${WSL_DISTRO_NAME:-}"
 platform="$(guard_platform_from_release "$(</proc/sys/kernel/osrelease)")"
@@ -32,6 +33,11 @@ done
 }
 umask 077
 
+if [[ -n "$(git -C "$repo_dir" status --porcelain)" ]]; then
+  printf 'Commit all source changes before installing so the binary commit is exact.\n' >&2
+  exit 1
+fi
+
 if [[ "$platform" == wsl2 ]]; then
   [[ -n "$distro_name" ]] || {
     printf 'WSL_DISTRO_NAME is required for a WSL2 installation.\n' >&2
@@ -46,12 +52,16 @@ fi
   printf 'The real Cargo executable was not found at %s\n' "$cargo_bin" >&2
   exit 1
 }
-for managed_path in "$guard_bin" "$unit_path" "$config_path" "$config_lkg_path" "$shim_dir" "$distro_path" "$environment_path"; do
+for managed_path in "$guard_bin" "$unit_path" "$config_path" "$config_lkg_path" "$shim_dir" "$distro_path" "$environment_path" "$state_root/install.json"; do
   if [[ -L "$managed_path" ]]; then
     printf 'A managed path cannot be a symlink: %s\n' "$managed_path" >&2
     exit 1
   fi
 done
+if [[ -e "$state_root/install.json" && ! -f "$state_root/install.json" ]]; then
+  printf 'The installation record must be a regular file: %s\n' "$state_root/install.json" >&2
+  exit 1
+fi
 
 install -d -m 0700 "$backup_root" "$state_root" "$HOME/.local/bin" "$unit_dir"
 old_active="$(systemctl --user is-active guardwsl.service 2>/dev/null || true)"
@@ -61,6 +71,7 @@ if [[ -e "$guard_bin" ]]; then cp -a -- "$guard_bin" "$backup_root/guard"; fi
 if [[ -e "$unit_path" ]]; then cp -a -- "$unit_path" "$backup_root/guardwsl.service"; fi
 if [[ -e "$config_path" ]]; then cp -a -- "$config_path" "$backup_root/config.toml"; fi
 if [[ -e "$config_lkg_path" ]]; then cp -a -- "$config_lkg_path" "$backup_root/config.last-good.toml"; fi
+if [[ -e "$state_root/install.json" ]]; then cp -a -- "$state_root/install.json" "$backup_root/install.json"; fi
 if [[ -d "$shim_dir" ]]; then cp -a -- "$shim_dir" "$backup_root/shims"; fi
 if [[ -e "$distro_path" ]]; then cp -a -- "$distro_path" "$backup_root/distro-name"; fi
 if [[ -e "$environment_path" ]]; then cp -a -- "$environment_path" "$backup_root/environment.conf"; fi
@@ -70,6 +81,7 @@ if [[ -e "$HOME/.zshrc" ]]; then cp -a -- "$HOME/.zshrc" "$backup_root/zshrc"; f
 
 rollback() {
   set +e
+  if [[ -n "$install_record_tmp" ]]; then rm -f -- "$install_record_tmp"; fi
   systemctl --user stop guardwsl.service >/dev/null 2>&1
   if [[ -e "$backup_root/guard" ]]; then
     install -m 0755 "$backup_root/guard" "$guard_bin"
@@ -91,6 +103,11 @@ rollback() {
     install -m 0600 "$backup_root/config.last-good.toml" "$config_lkg_path"
   else
     rm -f -- "$config_lkg_path"
+  fi
+  if [[ -e "$backup_root/install.json" ]]; then
+    install -m 0600 "$backup_root/install.json" "$state_root/install.json"
+  else
+    rm -f -- "$state_root/install.json"
   fi
   if [[ -e "$backup_root/distro-name" ]]; then
     install -m 0600 "$backup_root/distro-name" "$distro_path"
@@ -176,12 +193,23 @@ done
   false
 }
 
+binary_release="$("$guard_bin" --version)"
+version="$(printf '%s\n' "$binary_release" | awk '{print $2}')"
+commit="$(printf '%s\n' "$binary_release" | awk '{gsub(/[()]/, "", $4); print $4}')"
+commit_short="$(printf '%s' "$commit" | cut -c1-12)"
+source_commit="$(git -C "$repo_dir" rev-parse HEAD)"
+[[ "$binary_release" == "guard $version (commit $commit)" && "$commit" == "$source_commit" ]] || {
+  printf 'The installed binary identity does not match source commit %s.\n' "$source_commit" >&2
+  false
+}
+
+installed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+install_record_tmp="$(mktemp "$state_root/.install.XXXXXX")"
+printf '{"installed_at":"%s","backup":"%s","version":"%s","commit":"%s","commit_short":"%s"}\n' \
+  "$installed_at" "$backup_root" "$version" "$commit" "$commit_short" >"$install_record_tmp"
+chmod 0600 "$install_record_tmp"
+mv -f -- "$install_record_tmp" "$state_root/install.json"
+
 trap - ERR INT TERM
-printf '{"installed_at":"%s","backup":"%s","version":"%s"}\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  "$backup_root" \
-  "$("$guard_bin" --version | awk '{print $2}')" \
-  >"$state_root/install.json"
-chmod 0600 "$state_root/install.json"
 
 printf 'GuardWSL is installed and active. Backup: %s\n' "$backup_root"

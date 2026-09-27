@@ -8,6 +8,8 @@
 
 Review `scripts/install-linux.sh` before running it. The installer is
 user-scoped and does not require a Windows service or a root daemon.
+Run it from a clean Git checkout so the installed binary can identify the
+exact source commit.
 
 ## Install
 
@@ -27,7 +29,8 @@ The installer:
 5. initializes or strictly normalizes the private configuration;
    on WSL2 it also records the current distribution name for backing-volume discovery;
 6. enables the monitor and waits for `guard doctor` to become healthy;
-7. rolls back all managed files if any activation step fails.
+7. records the installed version, source commit, and UTC install time;
+8. rolls back all managed files if any activation step fails.
 
 Verify the result:
 
@@ -47,7 +50,12 @@ guard clean --dry-run
 ~/.config/systemd/user/guardwsl.service
 ~/.config/environment.d/20-guardwsl.conf
 ~/.local/state/guardwsl/
+~/.local/state/guardwsl/install.json
 ```
+
+`guard --version` shows the package version and full source commit.
+`guard status` shows the version and short commit in text; JSON includes the
+full commit and the install timestamp recorded in `install.json`.
 
 The installer also adds one marked PATH block to existing `.profile`,
 `.bashrc`, and `.zshrc` files. Backups live under
