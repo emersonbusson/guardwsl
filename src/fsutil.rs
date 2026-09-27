@@ -17,21 +17,15 @@ pub(crate) fn effective_uid() -> libc::uid_t {
     unsafe { libc::geteuid() }
 }
 
-#[must_use]
-pub(crate) fn effective_gid() -> libc::gid_t {
-    // SAFETY: getegid has no arguments, preconditions, or failure mode.
-    unsafe { libc::getegid() }
-}
-
 /// Directory owner/mode policy for cleanup candidates and scan roots.
-/// Group-write is allowed only for the current user's primary group.
+/// Group- and other-writable directories are rejected to prevent peer races.
 #[cfg(target_os = "linux")]
-pub(crate) fn is_unsafe_dir_owner_mode(uid: u32, gid: u32, mode: u32) -> bool {
-    uid != effective_uid() || mode & 0o002 != 0 || (mode & 0o020 != 0 && gid != effective_gid())
+pub(crate) fn is_unsafe_dir_owner_mode(uid: u32, mode: u32) -> bool {
+    uid != effective_uid() || mode & 0o022 != 0
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) const fn is_unsafe_dir_owner_mode(_uid: u32, _gid: u32, _mode: u32) -> bool {
+pub(crate) const fn is_unsafe_dir_owner_mode(_uid: u32, _mode: u32) -> bool {
     false
 }
 

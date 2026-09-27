@@ -539,18 +539,14 @@ fn inspect_candidate(
         bail!("candidate is not a real directory")
     }
     #[cfg(target_os = "linux")]
-    if is_unsafe_dir_owner_mode(metadata.uid(), metadata.gid(), metadata.mode()) {
+    if is_unsafe_dir_owner_mode(metadata.uid(), metadata.mode()) {
         bail!("candidate is not a private root owned by the current user")
     }
     let parent = path.parent().context("candidate has no parent directory")?;
     let parent_metadata = fs::symlink_metadata(parent)?;
     #[cfg(target_os = "linux")]
     if parent_metadata.file_type().is_symlink()
-        || is_unsafe_dir_owner_mode(
-            parent_metadata.uid(),
-            parent_metadata.gid(),
-            parent_metadata.mode(),
-        )
+        || is_unsafe_dir_owner_mode(parent_metadata.uid(), parent_metadata.mode())
     {
         bail!("candidate parent directory has an unsafe owner or mode")
     }
@@ -834,7 +830,8 @@ fn unescape_mount_path(value: &str) -> String {
 /// Inspects only processes with the same EUID as GuardWSL.
 ///
 /// This boundary is intentional: candidates, their parents, and scan roots are
-/// authenticated as owner-only writable. Only the base `systemd --user` and
+/// authenticated as owner-only writable through their immediate parent.
+/// Only the base `systemd --user` and
 /// `(sd-pam)` processes may deny reads without blocking a scan; any other
 /// incompletely inspected same-user process makes the candidate appear in use.
 fn path_is_in_use(candidate: &Path) -> Result<bool> {
@@ -1539,7 +1536,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn group_writable_primary_gid_parent_is_accepted() {
+    fn group_writable_parent_is_rejected_even_with_primary_gid() {
         let directory = tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let parent = directory.path().join("project");
@@ -1553,12 +1550,9 @@ mod tests {
         age(&candidate);
         let mut config = GuardConfig::default();
         config.cleanup.protected_paths.clear();
-        let result = inspect_candidate(&config, &candidate, CleanupKind::JavaScriptCache, None, 1);
-        assert!(
-            result.is_ok(),
-            "group-writable parent with primary gid should pass: {:?}",
-            result.err()
-        );
+        let error = inspect_candidate(&config, &candidate, CleanupKind::JavaScriptCache, None, 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("unsafe owner or mode"));
     }
 
     #[cfg(target_os = "linux")]
