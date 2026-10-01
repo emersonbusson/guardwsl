@@ -295,7 +295,7 @@ fn print_status(report: &Value) {
         roots
     );
     println!(
-        "Allowlist: npm/Yarn/pnpm/Cargo/Go caches; target, .next, .turbo, .vite, Python caches, and node_modules"
+        "Allowlist: npm/Yarn/pnpm/Bun/Cargo/Go caches, tool caches, target, .next, .turbo, .vite, Python caches, and node_modules"
     );
     if report["last_cleanup"].is_null() {
         println!("Last scan: not run yet");
