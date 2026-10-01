@@ -11,7 +11,7 @@ The design is deliberately conservative: uncertainty preserves data.
 
 ## Status
 
-The current source version is `0.1.1`. `guard --version` reports the full
+The current source version is `0.1.2`. `guard --version` reports the full
 source commit. `guard status` shows a compact version and short commit in text;
 its JSON report includes full commit and installation identity. Release
 archives ship `SHA256SUMS` and a complete install tree. No stable public
@@ -61,7 +61,7 @@ cd guardwsl-VERSION-x86_64-unknown-linux-gnu
 ./scripts/install-linux.sh
 ```
 
-Replace `VERSION` with the release you downloaded (for example `v0.1.1`). The
+Replace `VERSION` with the release you downloaded (for example `v0.1.2`). The
 installer uses the bundled binary and does not require Cargo or a Git checkout.
 
 ### Install from source

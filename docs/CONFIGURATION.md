@@ -33,7 +33,7 @@ Older legacy files using `version = 1` may also contain tables such as
 `[host_memory]`, and `[archive]`. Normalization carries forward supported
 cleanup ages, protected paths, and monitor intervals, then writes only the
 current schema. Legacy scan roots use the current default; reserve, workload,
-host-memory, and archive controls are not activated. GuardWSL v0.1.1 does not
+host-memory, and archive controls are not activated. GuardWSL does not
 create or manage a `reserve.bin` file, and configuration normalization never
 deletes files. The installer runs `guard config normalize` on the active config.
 

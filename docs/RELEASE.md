@@ -20,8 +20,8 @@ git status
 git diff origin/main
 
 # 2. Tag the release. The tag must be v<version> and match Cargo.toml.
-git tag -a v0.1.1 -m "GuardWSL v0.1.1"
-git push origin v0.1.1
+git tag -a v0.1.2 -m "GuardWSL v0.1.2"
+git push origin v0.1.2
 ```
 
 The `Release` workflow then:
