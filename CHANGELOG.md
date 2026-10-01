@@ -23,6 +23,14 @@ and the project intends to use [Semantic Versioning](https://semver.org/).
 - Release workflow verifies the tag against `Cargo.toml`, runs the test suite,
   checks that the binary commit matches the source commit, and publishes
   `SHA256SUMS`. The sloppy `v0.1.0-manual` fallback tag is gone.
+- Releases are automatic on merge, matching `ramshared`: `release-please`
+  maintains the release PR (version bump, changelog, `Cargo.toml`,
+  `Cargo.lock`), and merging that PR creates the `vX.Y.Z` tag, the GitHub
+  release, and the install artifacts in the same workflow run. No GitHub App
+  credentials and no manual `git tag` step.
+- A release identity test keeps `.release-please-manifest.json`, the
+  `# x-release-please-version` markers, and the release-please config in
+  lockstep with `Cargo.toml`.
 - CI runs the installer shell tests.
 - Workspace reference audit falls back to a built-in Python scanner when
   `ripgrep` is unavailable.
