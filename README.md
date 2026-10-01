@@ -110,6 +110,18 @@ common credential and control directories such as `.ssh`, `.gnupg`, `.config`,
 
 Read the full [safety model](docs/SAFETY.md) before enabling real cleanup.
 
+## Workspace reference audit
+
+When this checkout is inside a multi-repository workspace, run the read-only
+audit with:
+
+    python3 scripts/audit-workspace-references.py
+
+It checks sibling repository files and applies the documented Vitae and public
+profile README exceptions. See [Workspace reference audit](docs/WORKSPACE_REFERENCE_AUDIT.md)
+for scope and exit codes. The hosted CI for this standalone repository has no
+sibling checkouts to inspect.
+
 ## Development commands
 
 GuardWSL observes host-disk pressure for status and cleanup decisions only.
