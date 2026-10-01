@@ -133,6 +133,19 @@ separa bytes lógicos removidos da variação física observada no host.
 GuardWSL nunca converte ou compacta VHDX. A conversão de disco existente é uma
 operação administrativa offline, com WSL parado e backup verificado.
 
+## Auditoria de referências no workspace
+
+Quando este checkout estiver dentro de um workspace com vários repositórios,
+execute a auditoria somente leitura:
+
+    python3 scripts/audit-workspace-references.py
+
+Ela verifica os arquivos dos repositórios irmãos e preserva as exceções
+documentadas do Vitae e do README público do perfil. Consulte
+[Auditoria de referências no workspace](docs/WORKSPACE_REFERENCE_AUDIT.md)
+para conhecer o escopo e os códigos de saída. O CI hospedado deste repositório
+não possui os checkouts irmãos para verificar.
+
 ## Desenvolvimento
 
 ```bash
