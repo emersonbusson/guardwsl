@@ -1,42 +1,93 @@
 # Release process
 
-GuardWSL releases are built from annotated version tags. The hosted
-`Release` workflow refuses to publish unless every identity check passes.
+GuardWSL releases are **automatic on merge**, the same model as the
+`ramshared` repository: `release-please` maintains the release PR, and
+merging that PR creates the tag, the GitHub release, and the install
+artifacts without any manual `git tag` step.
 
-## Preconditions
+The hosted `Release` workflow refuses to publish unless every identity
+check passes. There is no manual fallback tag.
 
-- `CHANGELOG.md` has a dated section for the version being released, and
-  `## [Unreleased]` is empty.
-- `Cargo.toml` `version` matches the intended tag without the leading `v`.
-- `cargo fmt --all --check`, `cargo clippy --locked --all-targets -- -D warnings`,
-  and `cargo test --locked` pass locally.
-- `bash tests/install_platform.sh tests/install_order.sh` passes.
+## How a release is produced
 
-## Cut a release
-
-```bash
-# 1. Confirm the tree is clean and the changelog is ready.
-git status
-git diff origin/main
-
-# 2. Tag the release. The tag must be v<version> and match Cargo.toml.
-git tag -a v0.1.2 -m "GuardWSL v0.1.2"
-git push origin v0.1.2
+```text
+feature PR merges to main
+        |
+        v
+release-please opens / updates the release PR
+  (version bump + CHANGELOG.md + Cargo.toml + Cargo.lock)
+        |
+        v
+you merge the release PR
+        |
+        v
+release-please creates tag vX.Y.Z and the GitHub release
+        |
+        v
+the same workflow run builds, verifies, packages, and attaches
+guardwsl-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz + SHA256SUMS
 ```
 
-The `Release` workflow then:
+Commit titles drive the version bump. Use Conventional Commits:
 
-1. verifies the tag is `v*` and equals `v` + `Cargo.toml` `version`;
-2. runs `cargo test --locked` and `bash -n` on the installer scripts;
-3. builds the release binary with the pinned toolchain;
-4. verifies `guard --version` reports the checked-out commit and the tagged
+| Prefix | Effect |
+| --- | --- |
+| `feat:` | minor bump (0.1.2 -> 0.2.0) |
+| `fix:` | patch bump (0.1.2 -> 0.1.3) |
+| `perf:`, `refactor:`, `docs:`, `ci:` | patch bump, listed in the changelog |
+| `chore:`, `build:`, `test:`, `style:` | patch bump, hidden from the changelog |
+
+Everything before `0.2.0` stays on the `0.1.x` line only for `fix:`;
+`feat:` would go to `0.2.0`. Pre-`1.0.0` majors do not auto-bump.
+
+## What the workflow enforces
+
+1. the tag is `v*` and equals `v` + `Cargo.toml` `version`;
+2. `cargo test --locked` and `bash -n` on the installer scripts pass;
+3. the release binary is built with the pinned toolchain (`1.98.0`);
+4. `guard --version` reports the release commit **and** the tagged
    package version;
-5. packages a complete install tree (`guard`, `scripts/`, `systemd/`, docs,
-   licenses) into `guardwsl-<tag>-x86_64-unknown-linux-gnu.tar.gz`;
-6. writes `SHA256SUMS` and self-checks it against the archive;
-7. creates the GitHub release with `--verify-tag`.
+5. a complete install tree (`guard`, `scripts/`, `systemd/`, docs,
+   licenses) is packaged as `guardwsl-<tag>-x86_64-unknown-linux-gnu.tar.gz`;
+6. `SHA256SUMS` is written and self-checked against the archive;
+7. the GitHub release is created or updated with those assets.
 
-There is no manual fallback tag. A failed identity check blocks publication.
+A failed check blocks publication.
+
+## Bootstrap and recovery paths
+
+Two extra paths feed the same build/publish job:
+
+- **Bootstrap.** If `main` advances and the `Cargo.toml` version has no
+  matching `v*` tag yet, the workflow tags and publishes that version.
+  This covers the first release and any manual version bump merged
+  without a release PR. It never re-publishes an existing tag.
+- **Manual tag.** Pushing a `vX.Y.Z` tag runs the same build and
+  publishes a release for it. Use this only to recover from a stuck
+  release; the normal path needs no tag command.
+
+## Cutting a release by hand
+
+You normally do not. If you must drive it yourself:
+
+```bash
+# 1. Conventional commits land on main and release-please opens the release PR.
+# 2. Review that PR (CHANGELOG + version bump), then merge it.
+# 3. The Release workflow publishes. Nothing else to run.
+```
+
+## Pre-merge local checks
+
+These are the same gates CI runs, and are worth running before opening
+a PR:
+
+```bash
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+bash tests/install_platform.sh tests/install_order.sh
+bash -n scripts/install-linux.sh scripts/install-shims.sh scripts/platform.sh
+```
 
 ## Client verification
 
@@ -58,5 +109,14 @@ notes and the tagged source report.
 - Confirm the GitHub release has both the archive and `SHA256SUMS`.
 - Install the release on a clean machine (or a clean user account) using only
   the tarball path, to prove zero-friction install.
-- Move the changelog entries into a dated `## [<version>]` section if the
-  workflow did not already do so.
+- Confirm `guard --version` on the client matches the release tag.
+
+## Files release-please maintains
+
+| File | Role |
+| --- | --- |
+| `release-please-config.json` | release-type `simple`, tag `vX.Y.Z`, changelog sections |
+| `.release-please-manifest.json` | last released version per package (`"."`) |
+| `Cargo.toml` | `version` line carries `# x-release-please-version` |
+| `Cargo.lock` | `guardwsl` `version` line carries `# x-release-please-version` |
+| `CHANGELOG.md` | release-please prepends each released version |

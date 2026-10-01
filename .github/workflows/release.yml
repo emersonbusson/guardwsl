@@ -1,21 +1,134 @@
 name: Release
 
+# ramshared-style automatic release:
+#   merge to main  -> release-please opens/updates the release PR
+#   merge that PR  -> release-please creates the vX.Y.Z tag + GitHub release,
+#                     and this workflow builds and attaches the install tree
+#                     in the same run (so no GitHub App token is required).
+#   push a vX.Y.Z tag -> recovery path: same build + publish.
+
 on:
   push:
+    branches: [main]
     tags:
       - 'v*'
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
-  build-release:
-    name: Build, verify, and publish release
+  release-please:
+    name: Release PR / GitHub release
+    if: github.event_name == 'push' && github.ref_name == 'main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created || '' }}
+      tag_name: ${{ steps.rp.outputs.tag_name || '' }}
+      sha: ${{ steps.rp.outputs.sha || '' }}
+      version: ${{ steps.rp.outputs.version || '' }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # No GitHub App token here on purpose: the install tree is built and
+      # attached by the publish job in this same workflow run, so a
+      # GITHUB_TOKEN-created tag does not need to trigger a second workflow.
+      - name: Run release-please
+        id: rp
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  resolve-target:
+    name: Resolve release target
+    needs: [release-please]
+    if: >-
+      always() &&
+      (needs.release-please.result == 'success' || needs.release-please.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      should_publish: ${{ steps.decide.outputs.should_publish }}
+      tag_name: ${{ steps.decide.outputs.tag_name }}
+      ref_sha: ${{ steps.decide.outputs.ref_sha }}
+      create_release: ${{ steps.decide.outputs.create_release }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Decide what to publish
+        id: decide
+        env:
+          RELEASE_CREATED: ${{ needs.release-please.outputs.release_created || '' }}
+          RP_TAG: ${{ needs.release-please.outputs.tag_name || '' }}
+          RP_SHA: ${{ needs.release-please.outputs.sha || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # 1. release-please just created the tag + GitHub release.
+          if [[ "${RELEASE_CREATED}" == "true" && -n "${RP_TAG}" ]]; then
+            echo "release-please created ${RP_TAG} at ${RP_SHA}"
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "tag_name=${RP_TAG}" >> "$GITHUB_OUTPUT"
+            echo "ref_sha=${RP_SHA}" >> "$GITHUB_OUTPUT"
+            echo "create_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 2. A v* tag was pushed manually (recovery path).
+          if [[ "${EVENT_NAME}" == "push" && "${REF_TYPE}" == "tag" ]]; then
+            echo "tag push ${REF_NAME}"
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "tag_name=${REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "ref_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "create_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 3. main advanced and Cargo.toml's version has no tag yet.
+          #    Bootstraps the first release and covers a manual version bump
+          #    merged without a release PR. Never re-publishes an existing tag.
+          crate_version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+          if [[ -z "${crate_version}" ]]; then
+            echo "Could not read version from Cargo.toml." >&2
+            exit 1
+          fi
+          candidate="v${crate_version}"
+          git fetch --tags --force origin
+          if git rev-parse -q --verify "refs/tags/${candidate}" >/dev/null; then
+            echo "${candidate} already exists; nothing to publish."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "bootstrap ${candidate} at ${GITHUB_SHA}"
+          echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${candidate}" >> "$GITHUB_OUTPUT"
+          echo "ref_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "create_release=true" >> "$GITHUB_OUTPUT"
+
+  build-publish:
+    name: Build, verify, and publish release
+    needs: [resolve-target]
+    if: needs.resolve-target.outputs.should_publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve-target.outputs.ref_sha }}
+          fetch-depth: 0
 
       - name: Install pinned Rust toolchain
         run: |
@@ -23,22 +136,24 @@ jobs:
           rustup default 1.98.0
 
       - name: Verify tag matches Cargo.toml
+        env:
+          TAG_NAME: ${{ needs.resolve-target.outputs.tag_name }}
         run: |
-          tag_name="${GITHUB_REF_NAME}"
-          case "${tag_name}" in
+          set -euo pipefail
+          case "${TAG_NAME}" in
             v*) ;;
             *)
-              echo "Release tags must look like v0.1.2; got ${tag_name}" >&2
+              echo "Release tags must look like v0.1.2; got ${TAG_NAME}" >&2
               exit 1
               ;;
           esac
-          crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          crate_version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
           expected="v${crate_version}"
-          if [[ "${tag_name}" != "${expected}" ]]; then
-            echo "Tag ${tag_name} does not match Cargo.toml version ${crate_version}." >&2
+          if [[ "${TAG_NAME}" != "${expected}" ]]; then
+            echo "Tag ${TAG_NAME} does not match Cargo.toml version ${crate_version}." >&2
             exit 1
           fi
-          echo "Releasing ${tag_name} from Cargo.toml ${crate_version}"
+          echo "Releasing ${TAG_NAME} from Cargo.toml ${crate_version}"
 
       - name: Run tests
         run: cargo test --locked
@@ -50,25 +165,30 @@ jobs:
         run: cargo build --release --locked
 
       - name: Verify binary identity
+        env:
+          TAG_NAME: ${{ needs.resolve-target.outputs.tag_name }}
+          REF_SHA: ${{ needs.resolve-target.outputs.ref_sha }}
         run: |
+          set -euo pipefail
           version_line="$(./target/release/guard --version)"
           echo "${version_line}"
           commit="$(printf '%s\n' "${version_line}" | awk '{gsub(/[()]/, "", $4); print $4}')"
-          source_commit="$(git rev-parse HEAD)"
-          if [[ "${commit}" != "${source_commit}" ]]; then
-            echo "Binary commit ${commit} does not match source commit ${source_commit}." >&2
+          if [[ "${commit}" != "${REF_SHA}" ]]; then
+            echo "Binary commit ${commit} does not match release commit ${REF_SHA}." >&2
             exit 1
           fi
           package_version="$(printf '%s\n' "${version_line}" | awk '{print $2}')"
-          if [[ "v${package_version}" != "${GITHUB_REF_NAME}" ]]; then
-            echo "Binary version ${package_version} does not match tag ${GITHUB_REF_NAME}." >&2
+          if [[ "v${package_version}" != "${TAG_NAME}" ]]; then
+            echo "Binary version ${package_version} does not match tag ${TAG_NAME}." >&2
             exit 1
           fi
 
       - name: Package complete install tree
+        env:
+          TAG_NAME: ${{ needs.resolve-target.outputs.tag_name }}
         run: |
-          tag_name="${GITHUB_REF_NAME}"
-          archive_name="guardwsl-${tag_name}-x86_64-unknown-linux-gnu"
+          set -euo pipefail
+          archive_name="guardwsl-${TAG_NAME}-x86_64-unknown-linux-gnu"
           staging_dir="dist/${archive_name}"
           mkdir -p "${staging_dir}/scripts" "${staging_dir}/systemd" "${staging_dir}/docs"
           cp target/release/guard "${staging_dir}/guard"
@@ -88,14 +208,32 @@ jobs:
           echo "SHA256SUMS:"
           cat SHA256SUMS
 
-      - name: Create GitHub Release
+      - name: Publish GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.resolve-target.outputs.tag_name }}
+          REF_SHA: ${{ needs.resolve-target.outputs.ref_sha }}
+          CREATE_RELEASE: ${{ needs.resolve-target.outputs.create_release }}
         run: |
-          tag_name="${GITHUB_REF_NAME}"
-          gh release create "${tag_name}" \
-            guardwsl-*.tar.gz \
-            SHA256SUMS \
-            --title "GuardWSL ${tag_name}" \
-            --generate-notes \
-            --verify-tag
+          set -euo pipefail
+          git fetch --tags --force origin
+          if [[ "${CREATE_RELEASE}" == "true" ]]; then
+            if ! git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null; then
+              git tag -a "${TAG_NAME}" -m "GuardWSL ${TAG_NAME}" "${REF_SHA}"
+              git push origin "refs/tags/${TAG_NAME}"
+            fi
+            gh release create "${TAG_NAME}" \
+              guardwsl-*.tar.gz \
+              SHA256SUMS \
+              --title "GuardWSL ${TAG_NAME}" \
+              --generate-notes \
+              --verify-tag
+          else
+            # release-please already created the release; attach the install tree.
+            gh release upload "${TAG_NAME}" \
+              guardwsl-*.tar.gz \
+              SHA256SUMS \
+              --clobber
+          fi
+          echo "Published ${TAG_NAME}:"
+          gh release view "${TAG_NAME}" --json tagName,assets --jq '{tagName, assets: [.assets[].name]}'
