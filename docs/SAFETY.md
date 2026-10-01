@@ -7,7 +7,8 @@ space is preserved, even under disk pressure.
 
 The v1 allowlist is limited to:
 
-- npm, Yarn, pnpm, Cargo, and Go caches;
+- npm, Yarn (classic and Berry), pnpm (cache and store), Bun, Cargo, and Go caches;
+- shared compiler and IDE tool caches (`sccache`, `vscode-cpptools`, Playwright browsers);
 - Rust `target` directories;
 - `.next`, `.turbo`, `.vite`, `.pytest_cache`, `.mypy_cache`, and `.ruff_cache`;
 - `node_modules` with a recognized lockfile in the project directory or the

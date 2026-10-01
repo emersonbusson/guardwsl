@@ -93,7 +93,8 @@ guard exec -- <command> [args...]      # Forward a command directly
 
 The v1 allowlist contains:
 
-- npm, Yarn, pnpm, Cargo, and Go caches;
+- npm, Yarn (classic and Berry), pnpm (cache and store), Bun, Cargo, and Go caches;
+- shared compiler and IDE tool caches (`sccache`, `vscode-cpptools`, Playwright browsers);
 - Rust `target` directories;
 - `.next`, `.turbo`, `.vite`, `.pytest_cache`, `.mypy_cache`, and `.ruff_cache`;
 - `node_modules` when a recognized lockfile proves reproducibility.

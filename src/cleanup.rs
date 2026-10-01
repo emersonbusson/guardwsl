@@ -34,6 +34,7 @@ pub enum CleanupKind {
     JavaScriptCache,
     RustCache,
     GoCache,
+    ToolCache,
     ProjectCache,
     RustTarget,
     NextBuild,
@@ -43,7 +44,11 @@ pub enum CleanupKind {
 impl CleanupKind {
     const fn risk_rank(self) -> u8 {
         match self {
-            Self::JavaScriptCache | Self::RustCache | Self::GoCache | Self::ProjectCache => 0,
+            Self::JavaScriptCache
+            | Self::RustCache
+            | Self::GoCache
+            | Self::ToolCache
+            | Self::ProjectCache => 0,
             Self::RustTarget | Self::NextBuild => 1,
             Self::NodeModules => 2,
         }
@@ -54,6 +59,7 @@ impl CleanupKind {
             Self::JavaScriptCache => "javascript_cache",
             Self::RustCache => "rust_cache",
             Self::GoCache => "go_cache",
+            Self::ToolCache => "tool_cache",
             Self::ProjectCache => "project_cache",
             Self::RustTarget => "rust_target",
             Self::NextBuild => "next_build",
@@ -134,7 +140,11 @@ impl CleanupReport {
     }
 }
 
-pub fn plan_cleanup(config: &GuardConfig, pressure: DiskPressure) -> Result<CleanupPlan> {
+pub fn plan_cleanup(
+    config: &GuardConfig,
+    pressure: DiskPressure,
+    need_space: bool,
+) -> Result<CleanupPlan> {
     let mut plan = CleanupPlan {
         created_at: Utc::now(),
         pressure,
@@ -145,7 +155,8 @@ pub fn plan_cleanup(config: &GuardConfig, pressure: DiskPressure) -> Result<Clea
         return Ok(plan);
     }
 
-    add_global_caches(config, pressure, &mut plan);
+    let compress_ages = need_space || pressure != DiskPressure::Healthy;
+    add_global_caches(config, compress_ages, &mut plan);
     let discovery = discover_repositories(&config.cleanup.scan_roots)?;
     plan.skips
         .extend(discovery.skipped.into_iter().map(|skip| CleanupSkip {
@@ -160,7 +171,7 @@ pub fn plan_cleanup(config: &GuardConfig, pressure: DiskPressure) -> Result<Clea
             });
             continue;
         }
-        add_repository_candidates(config, pressure, &repository, &mut plan);
+        add_repository_candidates(config, compress_ages, &repository, &mut plan);
     }
 
     plan.candidates.sort_by(|left, right| {
@@ -324,7 +335,7 @@ pub fn execute_cleanup(
     Ok(report)
 }
 
-fn add_global_caches(config: &GuardConfig, pressure: DiskPressure, plan: &mut CleanupPlan) {
+fn add_global_caches(config: &GuardConfig, compress_ages: bool, plan: &mut CleanupPlan) {
     let Some(home) = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -335,15 +346,27 @@ fn add_global_caches(config: &GuardConfig, pressure: DiskPressure, plan: &mut Cl
         });
         return;
     };
-    let age = age_for(config, pressure, config.cleanup.cache_min_age_hours);
+    let age = age_for(config, compress_ages, config.cleanup.cache_min_age_hours);
     for (path, kind) in [
         (home.join(".npm/_cacache"), CleanupKind::JavaScriptCache),
         (home.join(".cache/yarn"), CleanupKind::JavaScriptCache),
         (home.join(".cache/pnpm"), CleanupKind::JavaScriptCache),
+        (home.join(".yarn/berry/cache"), CleanupKind::JavaScriptCache),
+        (
+            home.join(".bun/install/cache"),
+            CleanupKind::JavaScriptCache,
+        ),
+        (
+            home.join(".local/share/pnpm/store"),
+            CleanupKind::JavaScriptCache,
+        ),
         (home.join(".cargo/registry/cache"), CleanupKind::RustCache),
         (home.join(".cargo/git/checkouts"), CleanupKind::RustCache),
         (home.join(".cache/go-build"), CleanupKind::GoCache),
         (home.join("go/pkg/mod/cache"), CleanupKind::GoCache),
+        (home.join(".cache/sccache"), CleanupKind::ToolCache),
+        (home.join(".cache/vscode-cpptools"), CleanupKind::ToolCache),
+        (home.join(".cache/ms-playwright"), CleanupKind::ToolCache),
     ] {
         push_candidate(config, path, kind, None, age, plan);
     }
@@ -351,11 +374,11 @@ fn add_global_caches(config: &GuardConfig, pressure: DiskPressure, plan: &mut Cl
 
 fn add_repository_candidates(
     config: &GuardConfig,
-    pressure: DiskPressure,
+    compress_ages: bool,
     repository: &Repository,
     plan: &mut CleanupPlan,
 ) {
-    let cache_age = age_for(config, pressure, config.cleanup.cache_min_age_hours);
+    let cache_age = age_for(config, compress_ages, config.cleanup.cache_min_age_hours);
     for name in [
         ".turbo",
         ".vite",
@@ -381,7 +404,7 @@ fn add_repository_candidates(
                 project.join("target"),
                 CleanupKind::RustTarget,
                 Some(&repository.root),
-                age_for(config, pressure, config.cleanup.build_min_age_hours),
+                age_for(config, compress_ages, config.cleanup.build_min_age_hours),
                 plan,
             );
         }
@@ -391,7 +414,7 @@ fn add_repository_candidates(
                 project.join(".next"),
                 CleanupKind::NextBuild,
                 Some(&repository.root),
-                age_for(config, pressure, config.cleanup.build_min_age_hours),
+                age_for(config, compress_ages, config.cleanup.build_min_age_hours),
                 plan,
             );
             if find_lockfile(&project, Some(&repository.root)) {
@@ -400,7 +423,11 @@ fn add_repository_candidates(
                     project.join("node_modules"),
                     CleanupKind::NodeModules,
                     Some(&repository.root),
-                    age_for(config, pressure, config.cleanup.node_modules_min_age_hours),
+                    age_for(
+                        config,
+                        compress_ages,
+                        config.cleanup.node_modules_min_age_hours,
+                    ),
                     plan,
                 );
             }
@@ -499,8 +526,8 @@ fn find_lockfile(project: &Path, repository: Option<&Path>) -> bool {
     dir_has_lockfile(repo)
 }
 
-fn age_for(config: &GuardConfig, pressure: DiskPressure, normal: u64) -> u64 {
-    if matches!(pressure, DiskPressure::Critical | DiskPressure::Emergency) {
+fn age_for(config: &GuardConfig, compress_ages: bool, normal: u64) -> u64 {
+    if compress_ages {
         config.cleanup.critical_min_age_hours.min(normal)
     } else {
         normal
@@ -663,7 +690,10 @@ fn validate_context(path: &Path, kind: CleanupKind, repository: Option<&Path>) -
                 bail!("project cache has no Git identity")
             }
         }
-        CleanupKind::JavaScriptCache | CleanupKind::RustCache | CleanupKind::GoCache => {}
+        CleanupKind::JavaScriptCache
+        | CleanupKind::RustCache
+        | CleanupKind::GoCache
+        | CleanupKind::ToolCache => {}
     }
     Ok(())
 }
@@ -1075,7 +1105,7 @@ mod tests {
         let mut config = GuardConfig::default();
         config.cleanup.protected_paths.clear();
         config.cleanup.scan_roots = vec![root.clone()];
-        let plan = plan_cleanup(&config, DiskPressure::Critical).unwrap();
+        let plan = plan_cleanup(&config, DiskPressure::Critical, true).unwrap();
         for name in ["dist", "build", "out"] {
             assert!(
                 plan.candidates
@@ -1125,7 +1155,7 @@ mod tests {
         let mut config = GuardConfig::default();
         config.cleanup.protected_paths.clear();
         config.cleanup.scan_roots = vec![repo.clone()];
-        let plan = plan_cleanup(&config, DiskPressure::Healthy).unwrap();
+        let plan = plan_cleanup(&config, DiskPressure::Healthy, false).unwrap();
         let target = plan
             .candidates
             .iter()
@@ -1137,6 +1167,75 @@ mod tests {
                 )
             });
         assert_eq!(target.minimum_age_hours, config.cleanup.build_min_age_hours);
+    }
+
+    #[test]
+    fn pressure_and_need_space_compress_age_windows() {
+        let directory = tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let repo = fs::canonicalize(directory.path()).unwrap();
+        Command::new("git")
+            .args(["-c", "safe.directory=*", "init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        fs::write(repo.join(".gitignore"), b"/target\n").unwrap();
+        fs::write(
+            repo.join("Cargo.toml"),
+            b"[package]\nname='x'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::create_dir(repo.join("target")).unwrap();
+        #[cfg(target_os = "linux")]
+        fs::set_permissions(repo.join("target"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(repo.join("target/artifact"), vec![0_u8; 16]).unwrap();
+        age(&repo.join("target/artifact"));
+        age(&repo.join("target"));
+        let mut config = GuardConfig::default();
+        config.cleanup.protected_paths.clear();
+        config.cleanup.scan_roots = vec![repo.clone()];
+        config.cleanup.critical_min_age_hours = 2;
+
+        let healthy = plan_cleanup(&config, DiskPressure::Healthy, false).unwrap();
+        let healthy_target = healthy
+            .candidates
+            .iter()
+            .find(|item| item.path == repo.join("target"))
+            .expect("healthy plan keeps the target");
+        assert_eq!(
+            healthy_target.minimum_age_hours,
+            config.cleanup.build_min_age_hours
+        );
+
+        let pressured = plan_cleanup(&config, DiskPressure::Pressure, false).unwrap();
+        let pressured_target = pressured
+            .candidates
+            .iter()
+            .find(|item| item.path == repo.join("target"))
+            .expect("pressure plan keeps the target");
+        assert_eq!(
+            pressured_target.minimum_age_hours,
+            config.cleanup.critical_min_age_hours
+        );
+
+        let short_on_space = plan_cleanup(&config, DiskPressure::Healthy, true).unwrap();
+        let short_target = short_on_space
+            .candidates
+            .iter()
+            .find(|item| item.path == repo.join("target"))
+            .expect("below-target plan keeps the target");
+        assert_eq!(
+            short_target.minimum_age_hours,
+            config.cleanup.critical_min_age_hours
+        );
+    }
+
+    #[test]
+    fn tool_cache_kind_is_an_exact_global_allowlist_entry() {
+        assert_eq!(CleanupKind::ToolCache.as_str(), "tool_cache");
+        assert_eq!(CleanupKind::ToolCache.risk_rank(), 0);
+        assert!(validate_context(Path::new("/tmp/sccache"), CleanupKind::ToolCache, None).is_ok());
     }
 
     #[test]
@@ -1389,7 +1488,7 @@ mod tests {
         let mut config = GuardConfig::default();
         config.cleanup.protected_paths.clear();
         config.cleanup.scan_roots = vec![repo.clone()];
-        let plan = plan_cleanup(&config, DiskPressure::Healthy).unwrap();
+        let plan = plan_cleanup(&config, DiskPressure::Healthy, false).unwrap();
         assert!(
             plan.candidates
                 .iter()
@@ -1420,7 +1519,7 @@ mod tests {
         let mut config = GuardConfig::default();
         config.cleanup.protected_paths.clear();
         config.cleanup.scan_roots = vec![repo.clone()];
-        let plan = plan_cleanup(&config, DiskPressure::Healthy).unwrap();
+        let plan = plan_cleanup(&config, DiskPressure::Healthy, false).unwrap();
         assert!(
             !plan
                 .candidates
@@ -1460,7 +1559,7 @@ mod tests {
         let mut config = GuardConfig::default();
         config.cleanup.protected_paths.clear();
         config.cleanup.scan_roots = vec![repo.clone()];
-        let plan = plan_cleanup(&config, DiskPressure::Healthy).unwrap();
+        let plan = plan_cleanup(&config, DiskPressure::Healthy, false).unwrap();
         assert!(
             plan.candidates
                 .iter()
