@@ -126,3 +126,53 @@ fn status_reads_install_records_without_a_commit_field() {
     assert!(report["installed_commit"].is_null());
     assert!(report["installed_commit_short"].is_null());
 }
+
+#[test]
+fn status_json_allowlist_matches_every_cleanup_kind() {
+    let output = guard(&["status", "--json"], None);
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .expect("guard status --json should emit a JSON report");
+    let allowlist = report["cleanup_policy"]["allowlist"]
+        .as_array()
+        .expect("cleanup_policy.allowlist should be an array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    for kind in [
+        "javascript_cache",
+        "rust_cache",
+        "go_cache",
+        "tool_cache",
+        "project_cache",
+        "rust_target",
+        "next_build",
+        "node_modules",
+    ] {
+        assert!(
+            allowlist.contains(&kind),
+            "status allowlist should include {kind}, got {allowlist:?}"
+        );
+    }
+}
+
+#[test]
+fn doctor_reports_the_same_version_identity_as_status() {
+    let output = guard(&["doctor", "--json"], None);
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .expect("guard doctor --json should emit a JSON report");
+    assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
+    let commit = report["commit"].as_str().expect("doctor commit");
+    assert!(commit == "unknown" || commit.len() >= 40);
+    assert_eq!(
+        report["commit_short"].as_str().unwrap(),
+        &commit[..12.min(commit.len())]
+    );
+
+    let text = guard(&["doctor"], None);
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains(&format!(
+        "Version: {} (commit {})",
+        env!("CARGO_PKG_VERSION"),
+        report["commit_short"].as_str().unwrap()
+    )));
+}

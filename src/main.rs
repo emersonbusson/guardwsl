@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
-use guardwsl::cleanup::{CleanupMode, CleanupReport, execute_cleanup, plan_cleanup};
+use guardwsl::cleanup::{CleanupKind, CleanupMode, CleanupReport, execute_cleanup, plan_cleanup};
 use guardwsl::config::{ConfigStore, GuardConfig};
 use guardwsl::fsutil::{atomic_write_private, default_state_dir, ensure_private_dir, read_private};
 use guardwsl::history::AuditLog;
@@ -191,19 +191,7 @@ fn status(args: OutputArgs) -> Result<i32> {
             "cache_min_age_hours": config.cleanup.cache_min_age_hours,
             "build_min_age_hours": config.cleanup.build_min_age_hours,
             "node_modules_min_age_hours": config.cleanup.node_modules_min_age_hours,
-            "allowlist": [
-                "npm_yarn_pnpm_cache",
-                "cargo_cache",
-                "go_cache",
-                "target",
-                ".next",
-                ".turbo",
-                ".vite",
-                ".pytest_cache",
-                ".mypy_cache",
-                ".ruff_cache",
-                "node_modules"
-            ],
+            "allowlist": CleanupKind::allowlist_names(),
         },
         "last_cleanup": last_cleanup,
     });
@@ -294,9 +282,17 @@ fn print_status(report: &Value) {
         },
         roots
     );
-    println!(
-        "Allowlist: npm/Yarn/pnpm/Bun/Cargo/Go caches, tool caches, target, .next, .turbo, .vite, Python caches, and node_modules"
-    );
+    let allowlist = policy["allowlist"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| CleanupKind::allowlist_names().join(", "));
+    println!("Allowlist: {allowlist}");
     if report["last_cleanup"].is_null() {
         println!("Last scan: not run yet");
     } else {
@@ -685,12 +681,22 @@ fn doctor(args: OutputArgs) -> Result<i32> {
     let ok = checks
         .iter()
         .all(|check| check["ok"].as_bool() == Some(true));
+    let version = env!("CARGO_PKG_VERSION");
+    let commit = env!("GUARD_GIT_COMMIT");
+    let commit_short = env!("GUARD_GIT_COMMIT_SHORT");
     if args.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({"ok":ok,"checks":checks}))?
+            serde_json::to_string_pretty(&json!({
+                "ok": ok,
+                "version": version,
+                "commit": commit,
+                "commit_short": commit_short,
+                "checks": checks
+            }))?
         );
     } else {
+        println!("Version: {version} (commit {commit_short})");
         for check in &checks {
             println!(
                 "{} {:<14} {}",
