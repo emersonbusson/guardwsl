@@ -7,6 +7,8 @@ and the project intends to use [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-01
+
 ### Added
 
 - `CleanupKind::ALL` and `allowlist_names()` so `guard status` reports the real

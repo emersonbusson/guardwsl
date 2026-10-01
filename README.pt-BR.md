@@ -13,7 +13,7 @@ O desenho é deliberadamente conservador: na dúvida, os dados são preservados.
 
 ## Status
 
-A versão atual do código é `0.1.1`. `guard --version` mostra o SHA completo
+A versão atual do código é `0.1.2`. `guard --version` mostra o SHA completo
 do código-fonte. O texto de `guard status` mantém versão e SHA curto; o JSON
 inclui o SHA completo e os dados de instalação. Os arquivos de release
 incluem `SHA256SUMS` e a árvore de instalação completa. Ainda não há uma
@@ -63,7 +63,7 @@ cd guardwsl-VERSION-x86_64-unknown-linux-gnu
 ./scripts/install-linux.sh
 ```
 
-Substitua `VERSION` pela versão baixada (por exemplo `v0.1.1`). O instalador
+Substitua `VERSION` pela versão baixada (por exemplo `v0.1.2`). O instalador
 usa o binário incluído e não precisa de Cargo nem de checkout Git.
 
 ### Instalar a partir do código-fonte

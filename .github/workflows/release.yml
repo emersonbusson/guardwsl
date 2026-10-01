@@ -28,7 +28,7 @@ jobs:
           case "${tag_name}" in
             v*) ;;
             *)
-              echo "Release tags must look like v0.1.1; got ${tag_name}" >&2
+              echo "Release tags must look like v0.1.2; got ${tag_name}" >&2
               exit 1
               ;;
           esac
