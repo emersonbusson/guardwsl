@@ -221,7 +221,10 @@ jobs:
           git fetch --tags --force origin
           if [[ "${CREATE_RELEASE}" == "true" ]]; then
             if ! git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null; then
-              git tag -a "${TAG_NAME}" -m "GuardWSL ${TAG_NAME}" "${REF_SHA}"
+              # The runner has no committer identity; annotated tags need one.
+              git -c user.name="github-actions[bot]" \
+                  -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                  tag -a "${TAG_NAME}" -m "GuardWSL ${TAG_NAME}" "${REF_SHA}"
               git push origin "refs/tags/${TAG_NAME}"
             fi
             gh release create "${TAG_NAME}" \
