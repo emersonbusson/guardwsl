@@ -375,6 +375,14 @@ struct CleanupCycle {
     host_free_delta_bytes: Option<i64>,
 }
 
+fn below_target(config: &GuardConfig, snapshot: &HostSnapshot) -> bool {
+    snapshot.volume_free_bytes
+        < config
+            .disk
+            .effective_thresholds(snapshot.volume_total_bytes)
+            .target_free_bytes
+}
+
 fn run_cleanup(
     config: &GuardConfig,
     pressure: DiskPressure,
@@ -382,10 +390,10 @@ fn run_cleanup(
     host_before: Option<&HostSnapshot>,
 ) -> Result<CleanupCycle> {
     let audit = AuditLog::discover()?;
-    let mut plan = plan_cleanup(config, pressure)?;
-    if pressure != DiskPressure::Healthy
-        && let Some(snapshot) = host_before
-    {
+    let need_space = pressure != DiskPressure::Healthy
+        || host_before.is_some_and(|snapshot| below_target(config, snapshot));
+    let mut plan = plan_cleanup(config, pressure, need_space)?;
+    if need_space && let Some(snapshot) = host_before {
         let logical_budget = config
             .disk
             .effective_thresholds(snapshot.volume_total_bytes)
@@ -776,10 +784,10 @@ fn monitor(args: MonitorArgs) -> Result<i32> {
                     &config.disk,
                 );
                 pressure = Some(current);
-                let pressure_due =
-                    current != DiskPressure::Healthy && Instant::now() >= next_pressure_cleanup;
-                let scheduled_due =
-                    current == DiskPressure::Healthy && Instant::now() >= next_maintenance;
+                let need_space =
+                    current != DiskPressure::Healthy || below_target(&config, &snapshot);
+                let pressure_due = need_space && Instant::now() >= next_pressure_cleanup;
+                let scheduled_due = !need_space && Instant::now() >= next_maintenance;
                 if config.cleanup.enabled
                     && (pressure_due || scheduled_due)
                     && let Some(_maintenance) = MaintenanceLock::try_acquire()?
@@ -800,7 +808,9 @@ fn monitor(args: MonitorArgs) -> Result<i32> {
                             ) {
                                 Ok(cycle) if cycle.cleanup.succeeded() => {
                                     last_cleanup_at = Some(Utc::now());
-                                    if fresh_pressure != DiskPressure::Healthy {
+                                    let still_short = fresh_pressure != DiskPressure::Healthy
+                                        || below_target(&config, &fresh_snapshot);
+                                    if still_short {
                                         next_pressure_cleanup = Instant::now()
                                             + pressure_cleanup_cooldown(fresh_pressure);
                                     } else {
