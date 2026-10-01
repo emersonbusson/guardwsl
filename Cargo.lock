@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "guardwsl"
-version = "0.1.2"
+version = "0.1.2" # x-release-please-version
 dependencies = [
  "anyhow",
  "chrono",

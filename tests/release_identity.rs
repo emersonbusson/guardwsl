@@ -156,6 +156,48 @@ fn status_json_allowlist_matches_every_cleanup_kind() {
 }
 
 #[test]
+fn release_please_manifest_matches_the_crate_version() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(root.join(".release-please-manifest.json")).expect("release-please manifest"),
+    )
+    .expect("release-please manifest should be JSON");
+    let tracked = manifest["."]
+        .as_str()
+        .expect("manifest should track the root package at \".\"");
+    assert_eq!(
+        tracked,
+        env!("CARGO_PKG_VERSION"),
+        ".release-please-manifest.json must stay in lockstep with Cargo.toml"
+    );
+
+    let config = fs::read_to_string(root.join("release-please-config.json"))
+        .expect("release-please config should be readable");
+    assert!(
+        config.contains("\"release-type\": \"simple\""),
+        "release-please must keep the simple release type"
+    );
+    assert!(
+        config.contains("\"include-v-in-tag\": true"),
+        "release-please tags must keep the v prefix"
+    );
+
+    let cargo_toml = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
+    assert!(
+        cargo_toml.contains("# x-release-please-version"),
+        "Cargo.toml version line needs the x-release-please-version marker"
+    );
+    let cargo_lock = fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock");
+    assert!(
+        cargo_lock.contains(&format!(
+            "name = \"guardwsl\"\nversion = \"{}\" # x-release-please-version",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "Cargo.lock guardwsl version needs the x-release-please-version marker"
+    );
+}
+
+#[test]
 fn doctor_reports_the_same_version_identity_as_status() {
     let output = guard(&["doctor", "--json"], None);
     let report: Value = serde_json::from_slice(&output.stdout)

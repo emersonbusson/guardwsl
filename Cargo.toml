@@ -1,6 +1,6 @@
 [package]
 name = "guardwsl"
-version = "0.1.2"
+version = "0.1.2" # x-release-please-version
 edition = "2024"
 rust-version = "1.98.0"
 description = "Host-aware disk pressure protection for WSL2"
