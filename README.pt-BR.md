@@ -15,9 +15,10 @@ O desenho é deliberadamente conservador: na dúvida, os dados são preservados.
 
 A versão atual do código é `0.1.1`. `guard --version` mostra o SHA completo
 do código-fonte. O texto de `guard status` mantém versão e SHA curto; o JSON
-inclui o SHA completo e os dados de instalação. Ainda não há uma versão
-pública estável; revise um dry-run antes de ativar limpeza real em qualquer
-máquina.
+inclui o SHA completo e os dados de instalação. Os arquivos de release
+incluem `SHA256SUMS` e a árvore de instalação completa. Ainda não há uma
+versão pública estável; revise um dry-run antes de ativar limpeza real em
+qualquer máquina.
 
 ## O que a v1 faz
 
@@ -47,7 +48,25 @@ Requisitos:
 
 - Linux nativo ou WSL2 com systemd habilitado;
 - no WSL2, interoperabilidade com Windows PowerShell;
-- Rust 1.98.0, Cargo e Bash.
+- Bash. Um release pré-compilado não precisa de Rust; build a partir do
+  código-fonte precisa de Rust 1.98.0 e Cargo.
+
+### Instalar a partir de um release (recomendado para clientes)
+
+```bash
+# Baixe o release e o checksum, e verifique antes de extrair.
+curl -fLO "https://github.com/emersonbusson/guardwsl/releases/latest/download/guardwsl-VERSION-x86_64-unknown-linux-gnu.tar.gz"
+curl -fLO "https://github.com/emersonbusson/guardwsl/releases/latest/download/SHA256SUMS"
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf guardwsl-VERSION-x86_64-unknown-linux-gnu.tar.gz
+cd guardwsl-VERSION-x86_64-unknown-linux-gnu
+./scripts/install-linux.sh
+```
+
+Substitua `VERSION` pela versão baixada (por exemplo `v0.1.1`). O instalador
+usa o binário incluído e não precisa de Cargo nem de checkout Git.
+
+### Instalar a partir do código-fonte
 
 Revise o instalador antes de executá-lo:
 
@@ -65,6 +84,7 @@ inglês.
 Verifique sem apagar nada:
 
 ```bash
+guard --version
 guard doctor
 guard status
 guard clean --dry-run
@@ -76,6 +96,7 @@ O uso cotidiano é automático. Os comandos existem para inspecionar, diagnostic
 ou alternar políticas:
 
 ```text
+guard --version                        # Mostra a versão e o SHA completo do código-fonte
 guard doctor                           # Verifica a sonda de disco correspondente
 guard status                           # Inspeciona pressão no disco do host
 guard clean --dry-run                  # Simula a limpeza sem apagar nenhum arquivo
@@ -147,12 +168,34 @@ documentadas do Vitae e do README público do perfil. Consulte
 para conhecer o escopo e os códigos de saída. O CI hospedado deste repositório
 não possui os checkouts irmãos para verificar.
 
+## Solução de problemas
+
+- **`guard status` mostra `Host: unavailable`.** No WSL2, verifique se a
+  interoperabilidade com Windows PowerShell funciona
+  (`powershell.exe -NoProfile -Command 'echo ok'`). No Linux nativo, confira
+  se toda entrada de `scan_roots` existe e está em um único filesystem.
+  `guard doctor` nomeia a verificação que falhou.
+- **O disco continua cheio depois da limpeza.** O GuardWSL reporta bytes
+  lógicos removidos separadamente do espaço físico livre no host. Um VHDX
+  sparse não encolhe a cada exclusão, e o `fstrim` do WSL frequentemente
+  devolve quase nada. Confie no espaço livre do host em `guard status`, não
+  no `df` do guest.
+- **A limpeza removeu menos do que o esperado.** Janelas de idade, o orçamento
+  de ações por ciclo e os skips de segurança limitam cada execução.
+  `guard history` mostra o que foi tentado e por que um candidato foi pulado.
+  Dry-runs nunca removem.
+- **`sha256sum -c SHA256SUMS` falha.** Baixe os dois arquivos de novo; não
+  instale um release que não verifique.
+- **O instalador pede Cargo.** Você está em um checkout de código-fonte.
+  Instale o Rust 1.98.0 ou use um tarball de release, que já inclui o binário.
+
 ## Desenvolvimento
 
 ```bash
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+bash tests/install_platform.sh tests/install_order.sh
 cargo audit --deny warnings
 cargo deny check
 bash -n scripts/install-linux.sh scripts/install-shims.sh
@@ -162,8 +205,9 @@ Testes destrutivos usam somente diretórios temporários isolados. Eles nunca
 alteram WSL, Windows, Hyper-V ou dados reais de projetos.
 
 Consulte [Arquitetura](docs/ARCHITECTURE.md),
-[Configuração](docs/CONFIGURATION.md), [Contribuição](CONTRIBUTING.md) e
-[Política de segurança](SECURITY.md). Esses documentos são canônicos em inglês.
+[Configuração](docs/CONFIGURATION.md), [Processo de release](docs/RELEASE.md),
+[Contribuição](CONTRIBUTING.md) e [Política de segurança](SECURITY.md). Esses
+documentos são canônicos em inglês.
 
 ## Licença
 

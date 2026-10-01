@@ -101,15 +101,19 @@ candidate. Keep credential, configuration, database, upload, and application
 state directories protected. Protection does not turn an unknown path into a
 cleanup candidate; the exact cleanup allowlist always applies first.
 
-Age fields are hours. Under critical pressure, GuardWSL may reduce category age
-requirements, but never below `critical_min_age_hours`. It still applies every
-ownership, Git, mount, file-type, hard-link, process-use, and identity check.
+Age fields are hours. When free space is below `target_free_bytes` **or** disk
+pressure is anything other than Healthy, GuardWSL treats the volume as needing
+space and may compress category age requirements, but never below
+`critical_min_age_hours`. It still applies every ownership, Git, mount,
+file-type, hard-link, process-use, and identity check.
 
 Set `cleanup.enabled = false` to disable automatic and explicit cleanup without
 affecting command forwarding.
 
 ## Monitor
 
-The systemd user monitor probes every `interval_seconds`. Scheduled maintenance
-runs every `maintenance_interval_seconds`; pressure may trigger an earlier
-cycle subject to a bounded cooldown.
+The systemd user monitor probes every `interval_seconds`. A cleanup cycle is
+due when free space is below `target_free_bytes` or pressure is worse than
+Healthy (subject to a bounded cooldown), or when the scheduled maintenance
+interval has elapsed. Scheduled maintenance runs every
+`maintenance_interval_seconds`.
