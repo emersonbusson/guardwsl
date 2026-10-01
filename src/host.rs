@@ -312,7 +312,15 @@ fn current_distro_name() -> Result<String> {
 }
 
 fn validate_distro_name(distro: String) -> Result<String> {
-    if distro.is_empty() || distro.len() > 128 || distro.chars().any(char::is_control) {
+    // Matches the installer's `^[[:alnum:]._-]+$` so a name accepted at install
+    // time is also accepted at probe time, and anything else is rejected before
+    // it can reach the Windows host probe.
+    if distro.is_empty()
+        || distro.len() > 128
+        || !distro
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
         bail!("invalid WSL distribution name")
     }
     Ok(distro)
@@ -573,6 +581,34 @@ mod tests {
             forwarded_wslenv("GUARDWSL_DISTRO/u:PATH/l", "GUARDWSL_DISTRO"),
             "GUARDWSL_DISTRO/u:PATH/l"
         );
+    }
+
+    #[test]
+    fn distro_names_allow_only_installer_safe_characters() {
+        assert_eq!(
+            validate_distro_name("Ubuntu-22.04".to_owned()).unwrap(),
+            "Ubuntu-22.04"
+        );
+        assert_eq!(
+            validate_distro_name("Example_WSL.1".to_owned()).unwrap(),
+            "Example_WSL.1"
+        );
+        for invalid in [
+            "",
+            "has space",
+            "semi;colon",
+            "dollar$var",
+            "quote\"name",
+            "back\\slash",
+            "path/name",
+            "newline\nname",
+            &"x".repeat(129),
+        ] {
+            assert!(
+                validate_distro_name((*invalid).to_owned()).is_err(),
+                "expected {invalid:?} to be rejected"
+            );
+        }
     }
 
     #[test]

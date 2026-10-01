@@ -54,7 +54,7 @@ impl CleanupKind {
         }
     }
 
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::JavaScriptCache => "javascript_cache",
             Self::RustCache => "rust_cache",
@@ -65,6 +65,23 @@ impl CleanupKind {
             Self::NextBuild => "next_build",
             Self::NodeModules => "node_modules",
         }
+    }
+
+    /// Every cleanup kind in allowlist order (lowest risk first).
+    pub const ALL: [Self; 8] = [
+        Self::JavaScriptCache,
+        Self::RustCache,
+        Self::GoCache,
+        Self::ToolCache,
+        Self::ProjectCache,
+        Self::RustTarget,
+        Self::NextBuild,
+        Self::NodeModules,
+    ];
+
+    /// Machine-readable allowlist names, kept in sync with `Self::ALL`.
+    pub fn allowlist_names() -> Vec<&'static str> {
+        Self::ALL.iter().map(|kind| kind.as_str()).collect()
     }
 }
 
@@ -1236,6 +1253,18 @@ mod tests {
         assert_eq!(CleanupKind::ToolCache.as_str(), "tool_cache");
         assert_eq!(CleanupKind::ToolCache.risk_rank(), 0);
         assert!(validate_context(Path::new("/tmp/sccache"), CleanupKind::ToolCache, None).is_ok());
+    }
+
+    #[test]
+    fn allowlist_names_cover_every_cleanup_kind() {
+        let names = CleanupKind::allowlist_names();
+        assert_eq!(names.len(), CleanupKind::ALL.len());
+        for (kind, name) in CleanupKind::ALL.iter().zip(names.iter()) {
+            assert_eq!(kind.as_str(), *name);
+        }
+        assert!(names.contains(&"tool_cache"));
+        assert!(names.contains(&"javascript_cache"));
+        assert!(names.contains(&"node_modules"));
     }
 
     #[test]
