@@ -4,16 +4,15 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   build-release:
-    name: Build release binary
+    name: Build, verify, and publish release
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -23,33 +22,80 @@ jobs:
           rustup toolchain install 1.98.0 --profile minimal
           rustup default 1.98.0
 
+      - name: Verify tag matches Cargo.toml
+        run: |
+          tag_name="${GITHUB_REF_NAME}"
+          case "${tag_name}" in
+            v*) ;;
+            *)
+              echo "Release tags must look like v0.1.1; got ${tag_name}" >&2
+              exit 1
+              ;;
+          esac
+          crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          expected="v${crate_version}"
+          if [[ "${tag_name}" != "${expected}" ]]; then
+            echo "Tag ${tag_name} does not match Cargo.toml version ${crate_version}." >&2
+            exit 1
+          fi
+          echo "Releasing ${tag_name} from Cargo.toml ${crate_version}"
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Validate installer scripts
+        run: bash -n scripts/install-linux.sh scripts/install-shims.sh scripts/platform.sh
+
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Package artifacts
+      - name: Verify binary identity
         run: |
-          tag_name="${GITHUB_REF_NAME:-v0.1.0}"
+          version_line="$(./target/release/guard --version)"
+          echo "${version_line}"
+          commit="$(printf '%s\n' "${version_line}" | awk '{gsub(/[()]/, "", $4); print $4}')"
+          source_commit="$(git rev-parse HEAD)"
+          if [[ "${commit}" != "${source_commit}" ]]; then
+            echo "Binary commit ${commit} does not match source commit ${source_commit}." >&2
+            exit 1
+          fi
+          package_version="$(printf '%s\n' "${version_line}" | awk '{print $2}')"
+          if [[ "v${package_version}" != "${GITHUB_REF_NAME}" ]]; then
+            echo "Binary version ${package_version} does not match tag ${GITHUB_REF_NAME}." >&2
+            exit 1
+          fi
+
+      - name: Package complete install tree
+        run: |
+          tag_name="${GITHUB_REF_NAME}"
           archive_name="guardwsl-${tag_name}-x86_64-unknown-linux-gnu"
           staging_dir="dist/${archive_name}"
-          mkdir -p "${staging_dir}"
+          mkdir -p "${staging_dir}/scripts" "${staging_dir}/systemd" "${staging_dir}/docs"
           cp target/release/guard "${staging_dir}/guard"
-          cp README.md "${staging_dir}/README.md"
-          cp README.pt-BR.md "${staging_dir}/README.pt-BR.md"
-          cp LICENSE-APACHE "${staging_dir}/LICENSE-APACHE"
-          cp LICENSE-MIT "${staging_dir}/LICENSE-MIT"
+          chmod 0755 "${staging_dir}/guard"
+          cp scripts/install-linux.sh "${staging_dir}/scripts/"
+          cp scripts/install-shims.sh "${staging_dir}/scripts/"
+          cp scripts/platform.sh "${staging_dir}/scripts/"
+          chmod 0755 "${staging_dir}/scripts/"*.sh
+          cp systemd/guardwsl.service "${staging_dir}/systemd/"
+          cp README.md README.pt-BR.md CHANGELOG.md SECURITY.md "${staging_dir}/"
+          cp LICENSE-APACHE LICENSE-MIT "${staging_dir}/"
+          cp docs/INSTALLATION.md docs/CONFIGURATION.md docs/SAFETY.md docs/ARCHITECTURE.md "${staging_dir}/docs/"
           tar -czf "${archive_name}.tar.gz" -C dist "${archive_name}"
-          sha256sum "${archive_name}.tar.gz" > "${archive_name}.tar.gz.sha256"
+          sha256sum "${archive_name}.tar.gz" > SHA256SUMS
+          # Self-check: the published checksum must verify the published archive.
+          sha256sum -c SHA256SUMS
+          echo "SHA256SUMS:"
+          cat SHA256SUMS
 
       - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag_name="${GITHUB_REF_NAME}"
-          if [[ -z "${tag_name}" || "${tag_name}" == "main" ]]; then
-            tag_name="v0.1.0-manual"
-          fi
           gh release create "${tag_name}" \
             guardwsl-*.tar.gz \
-            guardwsl-*.tar.gz.sha256 \
+            SHA256SUMS \
             --title "GuardWSL ${tag_name}" \
-            --generate-notes
+            --generate-notes \
+            --verify-tag

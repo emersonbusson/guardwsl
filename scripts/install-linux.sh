@@ -19,6 +19,14 @@ install_record_tmp=""
 cargo_bin="$HOME/.cargo/bin/cargo"
 distro_name="${WSL_DISTRO_NAME:-}"
 platform="$(guard_platform_from_release "$(</proc/sys/kernel/osrelease)")"
+# Release tarballs ship a prebuilt `guard` next to `scripts/` and have no Git
+# metadata. Source checkouts build from Cargo instead.
+release_binary=""
+from_release=false
+if [[ ! -d "$repo_dir/.git" && -f "$repo_dir/guard" && -x "$repo_dir/guard" ]]; then
+  release_binary="$repo_dir/guard"
+  from_release=true
+fi
 real_tool_path=""
 IFS=: read -r -a path_entries <<<"${PATH:-}"
 for path_entry in "${path_entries[@]}"; do
@@ -33,9 +41,17 @@ done
 }
 umask 077
 
-if [[ -n "$(git -C "$repo_dir" status --porcelain)" ]]; then
-  printf 'Commit all source changes before installing so the binary commit is exact.\n' >&2
-  exit 1
+if [[ -z "$release_binary" ]]; then
+  if [[ -n "$(git -C "$repo_dir" status --porcelain)" ]]; then
+    printf 'Commit all source changes before installing so the binary commit is exact.\n' >&2
+    exit 1
+  fi
+  [[ -x "$cargo_bin" ]] || {
+    printf 'The real Cargo executable was not found at %s\n' "$cargo_bin" >&2
+    exit 1
+  }
+else
+  printf 'Installing the bundled release binary: %s\n' "$release_binary"
 fi
 
 if [[ "$platform" == wsl2 ]]; then
@@ -48,10 +64,6 @@ if [[ "$platform" == wsl2 ]]; then
     exit 1
   }
 fi
-[[ -x "$cargo_bin" ]] || {
-  printf 'The real Cargo executable was not found at %s\n' "$cargo_bin" >&2
-  exit 1
-}
 for managed_path in "$guard_bin" "$unit_path" "$config_path" "$config_lkg_path" "$shim_dir" "$distro_path" "$environment_path" "$state_root/install.json"; do
   if [[ -L "$managed_path" ]]; then
     printf 'A managed path cannot be a symlink: %s\n' "$managed_path" >&2
@@ -154,13 +166,16 @@ trap rollback ERR
 trap 'rollback; exit 130' INT TERM
 
 cd "$repo_dir"
-PATH="$real_tool_path" "$cargo_bin" test --locked
-PATH="$real_tool_path" "$cargo_bin" build --release --locked
+if [[ -z "$release_binary" ]]; then
+  PATH="$real_tool_path" "$cargo_bin" test --locked
+  PATH="$real_tool_path" "$cargo_bin" build --release --locked
+  release_binary="$repo_dir/target/release/guard"
+fi
 if [[ "$old_active" == "active" ]]; then
   systemctl --user stop guardwsl.service
 fi
 
-install -m 0755 "$repo_dir/target/release/guard" "$guard_bin"
+install -m 0755 "$release_binary" "$guard_bin"
 install -m 0644 "$repo_dir/systemd/guardwsl.service" "$unit_path"
 chmod 0600 "$config_path" 2>/dev/null || true
 if [[ -e "$config_path" ]]; then
@@ -197,11 +212,17 @@ binary_release="$("$guard_bin" --version)"
 version="$(printf '%s\n' "$binary_release" | awk '{print $2}')"
 commit="$(printf '%s\n' "$binary_release" | awk '{gsub(/[()]/, "", $4); print $4}')"
 commit_short="$(printf '%s' "$commit" | cut -c1-12)"
-source_commit="$(git -C "$repo_dir" rev-parse HEAD)"
-[[ "$binary_release" == "guard $version (commit $commit)" && "$commit" == "$source_commit" ]] || {
-  printf 'The installed binary identity does not match source commit %s.\n' "$source_commit" >&2
+[[ "$binary_release" == "guard $version (commit $commit)" ]] || {
+  printf 'The installed binary reported an unexpected version string: %s\n' "$binary_release" >&2
   false
 }
+if [[ "$from_release" != true && -d "$repo_dir/.git" ]]; then
+  source_commit="$(git -C "$repo_dir" rev-parse HEAD)"
+  [[ "$commit" == "$source_commit" ]] || {
+    printf 'The installed binary identity does not match source commit %s.\n' "$source_commit" >&2
+    false
+  }
+fi
 
 installed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 install_record_tmp="$(mktemp "$state_root/.install.XXXXXX")"

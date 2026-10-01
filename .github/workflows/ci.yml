@@ -34,8 +34,10 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --locked
+      - name: Run installer tests
+        run: bash tests/install_platform.sh tests/install_order.sh
       - name: Validate shell scripts
-        run: bash -n scripts/install-linux.sh scripts/install-shims.sh
+        run: bash -n scripts/install-linux.sh scripts/install-shims.sh scripts/platform.sh
 
   supply-chain:
     name: Supply-chain policy
