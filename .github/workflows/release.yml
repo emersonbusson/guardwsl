@@ -12,6 +12,8 @@ on:
     branches: [main]
     tags:
       - 'v*'
+  # Recovery lever: re-run the release-please / publish flow by hand.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -20,7 +22,7 @@ permissions:
 jobs:
   release-please:
     name: Release PR / GitHub release
-    if: github.event_name == 'push' && github.ref_name == 'main'
+    if: github.ref_name == 'main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
