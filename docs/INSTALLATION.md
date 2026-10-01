@@ -4,14 +4,34 @@
 
 - Native Linux or WSL2 with systemd enabled;
 - on WSL2, Windows PowerShell interoperability;
-- Rust 1.98.0, Cargo, and Bash.
+- Bash;
+- for a source install only: Rust 1.98.0, Cargo, and a clean Git checkout.
 
 Review `scripts/install-linux.sh` before running it. The installer is
 user-scoped and does not require a Windows service or a root daemon.
-Run it from a clean Git checkout so the installed binary can identify the
-exact source commit.
 
-## Install
+## Install from a release (no Rust required)
+
+1. Download the release archive and `SHA256SUMS` from the GitHub release page.
+2. Verify the archive before extracting it:
+
+   ```bash
+   sha256sum -c SHA256SUMS --ignore-missing
+   ```
+
+3. Extract and run the bundled installer:
+
+   ```bash
+   tar -xzf guardwsl-VERSION-x86_64-unknown-linux-gnu.tar.gz
+   cd guardwsl-VERSION-x86_64-unknown-linux-gnu
+   ./scripts/install-linux.sh
+   ```
+
+The release tree contains `guard`, `scripts/`, `systemd/`, documentation, and
+licenses. When the installer finds a bundled `guard` binary and no `.git`
+directory, it installs that binary directly and does not invoke Cargo.
+
+## Install from source
 
 ```bash
 git clone https://github.com/emersonbusson/guardwsl.git
@@ -19,11 +39,16 @@ cd guardwsl
 ./scripts/install-linux.sh
 ```
 
-The installer:
+Run it from a clean Git checkout so the installed binary can identify the
+exact source commit.
+
+## What the installer does
 
 1. backs up every managed user file;
-2. runs the Rust tests with GuardWSL shims removed from `PATH`;
-3. builds the release binary while the existing monitor remains active;
+2. runs the Rust tests with GuardWSL shims removed from `PATH`
+   (source install only);
+3. builds the release binary while the existing monitor remains active
+   (source install only);
 4. briefly stops the old monitor, then installs `~/.local/bin/guard`, the
    systemd user unit, and tool shims;
 5. initializes or strictly normalizes the private configuration;
@@ -35,6 +60,7 @@ The installer:
 Verify the result:
 
 ```bash
+guard --version
 guard doctor
 guard status
 guard clean --dry-run
