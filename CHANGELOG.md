@@ -7,6 +7,34 @@ and the project intends to use [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `CleanupKind::ALL` and `allowlist_names()` so `guard status` reports the real
+  cleanup allowlist instead of a hand-maintained summary list.
+- `guard doctor` now prints the same version and commit identity as
+  `guard status`, in both text and JSON.
+- Release tarballs ship a complete install tree (`guard`, installer scripts,
+  systemd unit, documentation, and licenses) so a client can install without a
+  Rust toolchain or a Git checkout.
+- `scripts/install-linux.sh` installs a bundled release binary when present and
+  only builds from Cargo in a source checkout.
+- Release workflow verifies the tag against `Cargo.toml`, runs the test suite,
+  checks that the binary commit matches the source commit, and publishes
+  `SHA256SUMS`. The sloppy `v0.1.0-manual` fallback tag is gone.
+- CI runs the installer shell tests.
+- Workspace reference audit falls back to a built-in Python scanner when
+  `ripgrep` is unavailable.
+
+### Changed
+
+- `guard status` JSON `cleanup_policy.allowlist` now lists every cleanup kind
+  (`javascript_cache`, `rust_cache`, `go_cache`, `tool_cache`, `project_cache`,
+  `rust_target`, `next_build`, `node_modules`).
+- WSL distribution names are validated against the same character class as the
+  installer (`[A-Za-z0-9._-]`), not just for length and control characters.
+- Documentation states that age windows compress whenever free space is below
+  the target **or** pressure is worse than Healthy.
+
 ## [0.1.1] - 2026-09-27
 
 ### Added

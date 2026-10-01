@@ -13,9 +13,10 @@ The design is deliberately conservative: uncertainty preserves data.
 
 The current source version is `0.1.1`. `guard --version` reports the full
 source commit. `guard status` shows a compact version and short commit in text;
-its JSON report includes full commit and installation identity. No stable
-public release has been published yet; review a dry run before enabling real
-cleanup on any machine.
+its JSON report includes full commit and installation identity. Release
+archives ship `SHA256SUMS` and a complete install tree. No stable public
+release has been published yet; review a dry run before enabling real cleanup
+on any machine.
 
 ## What v1 does
 
@@ -44,8 +45,26 @@ prove that a candidate artifact is regenerable and safe to remove.
 Requirements:
 
 - Native Linux or WSL2 with systemd enabled;
-- On WSL2, Windows PowerShell interoperability;
-- Rust 1.98.0, Cargo, and Bash.
+- on WSL2, Windows PowerShell interoperability;
+- Bash. A prebuilt release needs no Rust toolchain; building from source needs
+  Rust 1.98.0 and Cargo.
+
+### Install from a release (recommended for clients)
+
+```bash
+# Download the release and its checksum, then verify before extracting.
+curl -fLO "https://github.com/emersonbusson/guardwsl/releases/latest/download/guardwsl-VERSION-x86_64-unknown-linux-gnu.tar.gz"
+curl -fLO "https://github.com/emersonbusson/guardwsl/releases/latest/download/SHA256SUMS"
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf guardwsl-VERSION-x86_64-unknown-linux-gnu.tar.gz
+cd guardwsl-VERSION-x86_64-unknown-linux-gnu
+./scripts/install-linux.sh
+```
+
+Replace `VERSION` with the release you downloaded (for example `v0.1.1`). The
+installer uses the bundled binary and does not require Cargo or a Git checkout.
+
+### Install from source
 
 Review the installer before running it:
 
@@ -62,6 +81,7 @@ them back if the service does not become healthy. See
 Verify without deleting anything:
 
 ```bash
+guard --version
 guard doctor
 guard status
 guard clean --dry-run
@@ -73,6 +93,7 @@ Daily operation is automatic. Commands exist to inspect, diagnose, configure,
 or explicitly toggle policies:
 
 ```text
+guard --version                        # Show the package version and full source commit
 guard doctor                           # Check the relevant host-disk probe
 guard status                           # Inspect host-disk pressure
 guard clean --dry-run                  # Simulate cleanup without deleting files
@@ -146,6 +167,24 @@ GuardWSL never converts or compacts a VHDX. Existing-disk conversion is an
 offline administrative operation that requires stopped WSL instances and a
 verified backup.
 
+## Troubleshooting
+
+- **`guard status` says `Host: unavailable`.** On WSL2, check that Windows
+  PowerShell interoperability works (`powershell.exe -NoProfile -Command 'echo ok'`).
+  On native Linux, check that every `scan_roots` entry exists and lives on one
+  filesystem. `guard doctor` names the failing check.
+- **The disk still looks full after cleanup.** GuardWSL reports logical bytes
+  removed separately from physical host free space. A sparse VHDX does not
+  shrink on every delete, and WSL `fstrim` often returns almost nothing. Trust
+  `guard status` host free space, not guest `df`.
+- **Cleanup removed less than expected.** Age windows, the per-cycle action
+  budget, and safety skips all bound each run. `guard history` shows what was
+  attempted and why a candidate was skipped. Dry runs never delete.
+- **`sha256sum -c SHA256SUMS` fails.** Re-download both files; do not install
+  a release archive that does not verify.
+- **The installer wants Cargo.** You are in a source checkout. Either install
+  Rust 1.98.0 or use a release tarball, which ships a prebuilt binary.
+
 ## Development
 
 ```bash
@@ -162,7 +201,8 @@ Tests that exercise deletion use isolated temporary directories. They never
 mutate real Linux, WSL, Windows, Hyper-V, or project data.
 
 See [Architecture](docs/ARCHITECTURE.md),
-[Configuration](docs/CONFIGURATION.md), [Contributing](CONTRIBUTING.md), and
+[Configuration](docs/CONFIGURATION.md),
+[Release process](docs/RELEASE.md), [Contributing](CONTRIBUTING.md), and
 [Security Policy](SECURITY.md).
 
 ## License
