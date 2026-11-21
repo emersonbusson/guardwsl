@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn wsl2_snapshot_requires_vhdx_physical_size() {
+    fn missing_file_allocation_preserves_host_capacity_and_requires_vhdx_identity() {
         let raw = r#"{
           "schema_version":2,
           "platform":"wsl2",
@@ -769,7 +769,11 @@ mod tests {
           "volume_total_bytes":1000,
           "volume_free_bytes":500
         }"#;
-        assert!(parse_snapshot(raw.as_bytes()).is_err());
+        let snapshot = parse_snapshot(raw.as_bytes()).unwrap();
+        assert_eq!(snapshot.volume_free_bytes, 500);
+        assert_eq!(vhdx_occupancy_ratio(&snapshot), None);
+        let missing_identity = raw.replace("\"vhdx_sparse\":false,", "");
+        assert!(parse_snapshot(missing_identity.as_bytes()).is_err());
     }
 
     #[test]
