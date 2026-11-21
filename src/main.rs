@@ -1,24 +1,27 @@
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
-use guardwsl::cleanup::{CleanupKind, CleanupMode, CleanupReport, execute_cleanup, plan_cleanup};
-use guardwsl::config::{ConfigStore, GuardConfig};
+use guardwsl::cleanup::{
+    CacheAgePolicy, CleanupKind, CleanupMode, CleanupReport, execute_cleanup,
+    plan_cleanup_with_cache_policy,
+};
+use guardwsl::config::{ConfigStore, GuardConfig, needs_normalization};
 use guardwsl::fsutil::{atomic_write_private, default_state_dir, ensure_private_dir, read_private};
 use guardwsl::history::AuditLog;
 use guardwsl::host::{
-    DiskPressure, HostPlatform, HostSnapshot, PowerShellHostProbe, classify_disk, current_platform,
-    probe_linux_disk,
+    DiskPressure, HostPlatform, HostSnapshot, PowerShellHostProbe, classify_disk,
+    compaction_advised, current_platform, host_reclaim_possible, probe_linux_disk,
+    vhdx_occupancy_ratio,
 };
 use guardwsl::maintenance_lock::MaintenanceLock;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::ffi::{OsStr, OsString};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const NO_SAFE_RECLAIM: &str =
+    "Disk space is critically low and the last cleanup found no safe space to reclaim.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -53,15 +56,10 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Forwards a command directly to the underlying tool.
-    Exec(ExecArgs),
     /// Runs diagnostics and always prints every check.
     Doctor(OutputArgs),
     /// Shows recent audit records.
     History(HistoryArgs),
-    /// Internal entry point for tool shims.
-    #[command(hide = true)]
-    Shim(ShimArgs),
     /// Automatic user-scoped monitor.
     #[command(hide = true)]
     Monitor(MonitorArgs),
@@ -79,6 +77,9 @@ struct CleanArgs {
     dry_run: bool,
     #[arg(long)]
     json: bool,
+    /// Include recent allowlisted caches; retain build and dependency age limits.
+    #[arg(long)]
+    all_caches: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -88,19 +89,6 @@ enum ConfigCommand {
     Validate,
     #[command(hide = true)]
     Normalize,
-}
-
-#[derive(Debug, Args)]
-struct ExecArgs {
-    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-    command: Vec<OsString>,
-}
-
-#[derive(Debug, Args)]
-struct ShimArgs {
-    tool: OsString,
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    args: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
@@ -133,10 +121,8 @@ fn run() -> Result<i32> {
         Command::Status(args) => status(args),
         Command::Clean(args) => clean(args),
         Command::Config { command } => config(command),
-        Command::Exec(args) => execute_vector(args.command),
         Command::Doctor(args) => doctor(args),
         Command::History(args) => history(args),
-        Command::Shim(args) => execute_tool(args.tool, args.args),
         Command::Monitor(args) => monitor(args),
     }
 }
@@ -165,6 +151,19 @@ fn status(args: OutputArgs) -> Result<i32> {
             &config.disk,
         )
     });
+    let reclaim_possible = host.as_ref().ok().map(host_reclaim_possible);
+    let occupancy = host.as_ref().ok().and_then(vhdx_occupancy_ratio);
+    let advise_compaction = compaction_advised(
+        host.as_ref().ok(),
+        pressure,
+        last_cleanup
+            .as_ref()
+            .map(|cycle| cycle.cleanup.deleted_logical_bytes)
+            .unwrap_or(0),
+        last_cleanup
+            .as_ref()
+            .and_then(|cycle| cycle.host_free_delta_bytes),
+    );
     let report = json!({
         "service": "guardwsl",
         "version": env!("CARGO_PKG_VERSION"),
@@ -184,6 +183,9 @@ fn status(args: OutputArgs) -> Result<i32> {
         "host": host.as_ref().ok(),
         "host_error": host.as_ref().err().map(ToString::to_string),
         "pressure": pressure.map(DiskPressure::as_str),
+        "host_reclaim_possible": reclaim_possible,
+        "vhdx_occupancy_ratio": occupancy,
+        "compaction_advised": advise_compaction,
         "monitor": monitor_report,
         "cleanup_policy": {
             "enabled": config.cleanup.enabled,
@@ -240,16 +242,26 @@ fn print_status(report: &Value) {
             report["pressure"].as_str().unwrap_or("unknown"),
         );
         match host["platform"].as_str() {
-            Some("wsl2") => println!(
-                "WSL2/Windows backing volume: {} at {} | sparse VHDX: {}",
-                host["distro"].as_str().unwrap_or("?"),
-                host["vhdx_path"].as_str().unwrap_or("?"),
-                if host["vhdx_sparse"].as_bool() == Some(true) {
-                    "yes"
-                } else {
-                    "no - deletion frees ext4 space but does not shrink the physical file"
+            Some("wsl2") => {
+                println!(
+                    "WSL2/Windows backing volume: {} at {} | sparse VHDX: {}",
+                    host["distro"].as_str().unwrap_or("?"),
+                    host["vhdx_path"].as_str().unwrap_or("?"),
+                    if host["vhdx_sparse"].as_bool() == Some(true) {
+                        "yes"
+                    } else {
+                        "no - deletion frees ext4 space but does not shrink the physical file"
+                    }
+                );
+                if let Some(size) = host["vhdx_size_bytes"].as_u64() {
+                    println!(
+                        "WSL2 VHDX occupancy: {} of {} host volume ({:.1}%)",
+                        format_bytes(size),
+                        format_bytes(host["volume_total_bytes"].as_u64().unwrap_or(0)),
+                        report["vhdx_occupancy_ratio"].as_f64().unwrap_or(0.0) * 100.0
+                    );
                 }
-            ),
+            }
             Some("linux") => println!(
                 "Linux local filesystem: {}",
                 host["volume_root"].as_str().unwrap_or("?")
@@ -335,6 +347,19 @@ fn print_status(report: &Value) {
                 .unwrap_or("unknown")
         );
     }
+    if report["monitor"]["no_safe_reclaim"].as_bool() == Some(true) {
+        println!("Warning: {NO_SAFE_RECLAIM}");
+    }
+    if report["compaction_advised"].as_bool() == Some(true) {
+        println!(
+            "WARN: host space cannot be reclaimed by cleanup (non-sparse VHDX). \
+             Offline compaction is required; see docs/SAFETY.md."
+        );
+    } else if report["host_reclaim_possible"].as_bool() == Some(false) {
+        println!(
+            "Note: non-sparse VHDX - cleanup prevents further growth but does not shrink the physical file."
+        );
+    }
 }
 
 fn clean(args: CleanArgs) -> Result<i32> {
@@ -343,12 +368,10 @@ fn clean(args: CleanArgs) -> Result<i32> {
         bail!("configuration is degraded; real cleanup is blocked")
     }
     let _lock = MaintenanceLock::acquire(Duration::from_secs(30))?;
-    let snapshot = probe_host(&loaded.config)?;
-    let pressure = classify_disk(
-        snapshot.volume_free_bytes,
-        snapshot.volume_total_bytes,
-        &loaded.config.disk,
-    );
+    let host = probe_host(&loaded.config);
+    let host_error = host.as_ref().err().map(|error| format!("{error:#}"));
+    let snapshot = host.as_ref().ok();
+    let pressure = cleanup_pressure(&loaded.config, snapshot);
     let cycle = run_cleanup(
         &loaded.config,
         pressure,
@@ -357,18 +380,46 @@ fn clean(args: CleanArgs) -> Result<i32> {
         } else {
             CleanupMode::Execute
         },
-        Some(&snapshot),
+        snapshot,
+        if args.all_caches {
+            CacheAgePolicy::IncludeRecent
+        } else {
+            CacheAgePolicy::Retention
+        },
+        host_error.as_deref(),
     )?;
     print_cleanup(&cycle, args.json)?;
-    Ok(if cycle.cleanup.succeeded() { 0 } else { 1 })
+    Ok(
+        if cycle.cleanup.succeeded() && cycle.trim_error.is_none() && host_error.is_none() {
+            0
+        } else {
+            1
+        },
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CleanupCycle {
     cleanup: CleanupReport,
+    #[serde(default)]
+    cache_age_policy: CacheAgePolicy,
     host_free_before_bytes: Option<u64>,
     host_free_after_bytes: Option<u64>,
     host_free_delta_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_telemetry_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trim_error: Option<String>,
+    /// None means host reclaim is unknown. False means a non-sparse VHDX.
+    #[serde(default)]
+    host_reclaim_possible: Option<bool>,
+    #[serde(default)]
+    vhdx_size_bytes: Option<u64>,
+    #[serde(default)]
+    vhdx_occupancy_ratio: Option<f64>,
+    /// Offline VHDX compaction is required to recover host space.
+    #[serde(default)]
+    compaction_advised: bool,
 }
 
 fn below_target(config: &GuardConfig, snapshot: &HostSnapshot) -> bool {
@@ -379,32 +430,88 @@ fn below_target(config: &GuardConfig, snapshot: &HostSnapshot) -> bool {
             .target_free_bytes
 }
 
+// Unknown host pressure never becomes an invented free-space measurement.
+// Retention cleanup can still run independently with conservative pressure.
+fn cleanup_pressure(config: &GuardConfig, snapshot: Option<&HostSnapshot>) -> DiskPressure {
+    snapshot.map_or(DiskPressure::Pressure, |snapshot| {
+        classify_disk(
+            snapshot.volume_free_bytes,
+            snapshot.volume_total_bytes,
+            &config.disk,
+        )
+    })
+}
+
+/// Bound a plan by the space deletion can actually reclaim toward `target`.
+///
+/// The budget is host free vs host target only when deletion returns host
+/// blocks (native Linux, or a sparse VHDX). On a non-sparse VHDX that budget
+/// is unreachable and would under-clean under pressure. `Emergency` skips it
+/// entirely: reclaim what is safe now, before any out-of-scope recovery.
+fn apply_logical_budget(
+    plan: &mut guardwsl::cleanup::CleanupPlan,
+    config: &GuardConfig,
+    snapshot: &HostSnapshot,
+    pressure: DiskPressure,
+    need_space: bool,
+    reclaim_possible: bool,
+) {
+    if !need_space || !reclaim_possible || pressure == DiskPressure::Emergency {
+        return;
+    }
+    let logical_budget = config
+        .disk
+        .effective_thresholds(snapshot.volume_total_bytes)
+        .target_free_bytes
+        .saturating_sub(snapshot.volume_free_bytes);
+    let mut selected = 0_u64;
+    plan.candidates.retain(|candidate| {
+        if selected >= logical_budget {
+            return false;
+        }
+        selected = selected.saturating_add(candidate.estimated_bytes);
+        true
+    });
+}
+
 fn run_cleanup(
     config: &GuardConfig,
     pressure: DiskPressure,
     mode: CleanupMode,
     host_before: Option<&HostSnapshot>,
+    cache_policy: CacheAgePolicy,
+    host_telemetry_error: Option<&str>,
 ) -> Result<CleanupCycle> {
     let audit = AuditLog::discover()?;
     let need_space = pressure != DiskPressure::Healthy
         || host_before.is_some_and(|snapshot| below_target(config, snapshot));
-    let mut plan = plan_cleanup(config, pressure, need_space)?;
-    if need_space && let Some(snapshot) = host_before {
-        let logical_budget = config
-            .disk
-            .effective_thresholds(snapshot.volume_total_bytes)
-            .target_free_bytes
-            .saturating_sub(snapshot.volume_free_bytes);
-        let mut selected = 0_u64;
-        plan.candidates.retain(|candidate| {
-            if selected >= logical_budget {
-                return false;
-            }
-            selected = selected.saturating_add(candidate.estimated_bytes);
-            true
-        });
+    let mut plan = plan_cleanup_with_cache_policy(config, pressure, need_space, cache_policy)?;
+    // A host-free budget is only meaningful when deletion can return host
+    // blocks. On a non-sparse VHDX that budget is unreachable and would
+    // under-clean exactly when pressure is highest; max_actions_per_cycle and
+    // risk order still bound the plan.
+    let reclaim_possible = host_before.is_none_or(host_reclaim_possible);
+    if cache_policy == CacheAgePolicy::Retention
+        && let Some(snapshot) = host_before
+    {
+        apply_logical_budget(
+            &mut plan,
+            config,
+            snapshot,
+            pressure,
+            need_space,
+            reclaim_possible,
+        );
     }
     let cleanup = execute_cleanup(config, &plan, mode, &audit)?;
+    let trim_error =
+        if mode == CleanupMode::Execute && (cleanup.deleted_logical_bytes > 0 || need_space) {
+            discard_guest_blocks()
+                .err()
+                .map(|error| format!("{error:#}"))
+        } else {
+            None
+        };
     let host_after = if mode == CleanupMode::Execute {
         probe_host(config).ok()
     } else {
@@ -419,15 +526,47 @@ fn run_cleanup(
             .unwrap_or(i64::MAX)
             .saturating_sub(i64::try_from(before).unwrap_or(i64::MAX))
     });
+    let identity = host_before.or(host_after.as_ref());
+    let advise_compaction = compaction_advised(
+        identity,
+        Some(pressure),
+        cleanup.deleted_logical_bytes,
+        delta,
+    );
     let cycle = CleanupCycle {
+        cache_age_policy: cache_policy,
+        host_reclaim_possible: identity.map(host_reclaim_possible),
+        vhdx_size_bytes: identity.and_then(|snapshot| snapshot.vhdx_size_bytes),
+        vhdx_occupancy_ratio: identity.and_then(vhdx_occupancy_ratio),
+        compaction_advised: advise_compaction,
         cleanup,
         host_free_before_bytes: before_free,
         host_free_after_bytes: after_free,
         host_free_delta_bytes: delta,
+        host_telemetry_error: host_telemetry_error.map(str::to_owned),
+        trim_error,
     };
     let path = default_state_dir()?.join("cleanup-last.json");
     atomic_write_private(&path, &serde_json::to_vec_pretty(&cycle)?)?;
     Ok(cycle)
+}
+
+fn discard_guest_blocks() -> Result<()> {
+    let (program, args): (&str, &[&str]) = if Path::new("/usr/bin/sudo").is_file() {
+        ("/usr/bin/sudo", &["-n", "/usr/sbin/fstrim", "/"])
+    } else {
+        ("/usr/sbin/fstrim", &["/"])
+    };
+    discard_guest_blocks_with(program, args)
+}
+
+fn discard_guest_blocks_with(program: &str, args: &[&str]) -> Result<()> {
+    let output = guardwsl::host::run_bounded_trim(program, args, Duration::from_secs(60))
+        .context("guest block discard did not complete")?;
+    if !output.status.success() || output.stdout_truncated || output.stderr_truncated {
+        bail!("guest block discard failed ({})", output.status)
+    }
+    Ok(())
 }
 
 fn print_cleanup(cycle: &CleanupCycle, json_output: bool) -> Result<()> {
@@ -465,6 +604,25 @@ fn print_cleanup(cycle: &CleanupCycle, json_output: bool) -> Result<()> {
             "Observed physical host delta: {}{}",
             if delta >= 0 { "+" } else { "" },
             format_bytes(delta.unsigned_abs())
+        );
+    }
+    if let Some(error) = &cycle.trim_error {
+        println!("WARN: {error}");
+    }
+    if let Some(error) = &cycle.host_telemetry_error {
+        println!("WARN: host telemetry unavailable; safe cleanup used no host target: {error}");
+    }
+    if let Some(ratio) = cycle.vhdx_occupancy_ratio {
+        println!("VHDX occupancy: {:.1}% of the host volume", ratio * 100.0);
+    }
+    if cycle.compaction_advised {
+        println!(
+            "WARN: host space cannot be reclaimed by cleanup (non-sparse VHDX). \
+             Offline compaction is required; see docs/SAFETY.md."
+        );
+    } else if cycle.host_reclaim_possible == Some(false) {
+        println!(
+            "Note: non-sparse VHDX - cleanup prevents further growth but does not shrink the physical file."
         );
     }
     Ok(())
@@ -513,113 +671,21 @@ fn config(command: ConfigCommand) -> Result<i32> {
             if loaded.degraded {
                 bail!("configuration is degraded; normalization is blocked")
             }
+            let path = &store.paths().user;
+            if path.exists() {
+                let bytes = read_private(path, 256 * 1024)?;
+                let text = std::str::from_utf8(&bytes).context("configuration is not UTF-8")?;
+                if !needs_normalization(text)? {
+                    // Leave user comments and formatting alone.
+                    println!("Configuration is already normalized; file left untouched.");
+                    return Ok(0);
+                }
+            }
             store.save(&loaded.config)?;
             println!("Configuration normalized to schema v1.");
         }
     }
     Ok(0)
-}
-
-fn execute_vector(command: Vec<OsString>) -> Result<i32> {
-    let (tool, args) = command.split_first().context("missing command")?;
-    execute_tool(tool.clone(), args.to_vec())
-}
-
-fn execute_tool(tool: OsString, args: Vec<OsString>) -> Result<i32> {
-    let executable = resolve_tool(&tool)?;
-    run_child(&executable, &args)
-}
-
-fn resolve_tool(tool: &OsStr) -> Result<PathBuf> {
-    let path = Path::new(tool);
-    if path.components().count() > 1 {
-        return Ok(path.to_path_buf());
-    }
-    let current = std::env::current_exe()
-        .ok()
-        .and_then(|path| fs::canonicalize(path).ok());
-    let path_value = std::env::var_os("PATH").context("PATH is missing")?;
-    for directory in std::env::split_paths(&path_value) {
-        if directory.to_string_lossy().contains("guardwsl/shims") {
-            continue;
-        }
-        for name in [tool.to_os_string(), {
-            let mut value = tool.to_os_string();
-            value.push(".exe");
-            value
-        }] {
-            let candidate = directory.join(name);
-            let Ok(metadata) = fs::metadata(&candidate) else {
-                continue;
-            };
-            if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-                continue;
-            }
-            let canonical = fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-            if current.as_ref() == Some(&canonical) {
-                continue;
-            }
-            return Ok(candidate);
-        }
-    }
-    if let Some(candidate) = resolve_version_manager_tool(tool) {
-        return Ok(candidate);
-    }
-    bail!("real executable not found for {}", tool.to_string_lossy())
-}
-
-fn resolve_version_manager_tool(tool: &OsStr) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())?;
-    let mut roots = Vec::new();
-    if let Some(nvm_bin) = std::env::var_os("NVM_BIN") {
-        roots.push(PathBuf::from(nvm_bin));
-    }
-    let versions = home.join(".nvm/versions/node");
-    if let Ok(entries) = fs::read_dir(versions) {
-        let mut entries = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-        entries.sort();
-        entries.reverse();
-        roots.extend(entries.into_iter().map(|version| version.join("bin")));
-    }
-    roots.push(home.join(".bun/bin"));
-    for root in roots {
-        for name in [tool.to_os_string(), {
-            let mut value = tool.to_os_string();
-            value.push(".exe");
-            value
-        }] {
-            let candidate = root.join(name);
-            let Ok(metadata) = fs::metadata(&candidate) else {
-                continue;
-            };
-            if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-fn run_child(executable: &Path, args: &[OsString]) -> Result<i32> {
-    let mut command = ProcessCommand::new(executable);
-    command.args(args);
-    let status = command
-        .status()
-        .with_context(|| format!("failed to start {}", executable.display()))?;
-    Ok(exit_code(status))
-}
-
-fn exit_code(status: ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        return code;
-    }
-    use std::os::unix::process::ExitStatusExt;
-    status.signal().map_or(1, |signal| 128 + signal)
 }
 
 fn history(args: HistoryArgs) -> Result<i32> {
@@ -632,10 +698,7 @@ fn history(args: HistoryArgs) -> Result<i32> {
         for record in records {
             println!(
                 "{} {:?} {} {}",
-                record.at.to_rfc3339(),
-                record.outcome,
-                record.event,
-                record.detail
+                record.at, record.outcome, record.event, record.detail
             );
         }
     }
@@ -644,6 +707,7 @@ fn history(args: HistoryArgs) -> Result<i32> {
 
 fn doctor(args: OutputArgs) -> Result<i32> {
     let mut checks = Vec::new();
+    let mut warnings = Vec::new();
     let store = ConfigStore::discover();
     let loaded = store
         .as_ref()
@@ -658,17 +722,34 @@ fn doctor(args: OutputArgs) -> Result<i32> {
         .as_ref()
         .map(|loaded| loaded.config.clone())
         .unwrap_or_default();
-    match probe_host(&config) {
-        Ok(snapshot) => checks.push(json!({
-            "name":"host_probe",
-            "ok":true,
-            "detail":{"volume":snapshot.volume_root,"free_bytes":snapshot.volume_free_bytes}
-        })),
-        Err(error) => {
-            checks.push(json!({"name":"host_probe","ok":false,"detail":error.to_string()}))
+    let host_snapshot = match probe_host(&config) {
+        Ok(snapshot) => {
+            checks.push(json!({
+                "name":"host_probe",
+                "ok":true,
+                "detail":{
+                    "volume":snapshot.volume_root,
+                    "free_bytes":snapshot.volume_free_bytes,
+                    "vhdx_size_bytes":snapshot.vhdx_size_bytes,
+                    "host_reclaim_possible":host_reclaim_possible(&snapshot),
+                }
+            }));
+            Some(snapshot)
         }
-    }
+        Err(error) => {
+            checks.push(json!({"name":"host_probe","ok":false,"detail":error.to_string()}));
+            None
+        }
+    };
+    // Boot integration: the monitor must come up with WSL2, not only at login.
+    checks.push(boot_integration_check());
     let monitor = read_monitor_status(&config);
+    if monitor
+        .as_ref()
+        .is_some_and(|status| status.no_safe_reclaim)
+    {
+        warnings.push(NO_SAFE_RECLAIM.to_owned());
+    }
     checks.push(json!({
         "name":"monitor",
         "ok":monitor.as_ref().is_some_and(|status| status.healthy(&config)),
@@ -677,6 +758,38 @@ fn doctor(args: OutputArgs) -> Result<i32> {
     match AuditLog::discover().and_then(|log| log.tail(1)) {
         Ok(_) => checks.push(json!({"name":"audit","ok":true,"detail":"history is readable"})),
         Err(error) => checks.push(json!({"name":"audit","ok":false,"detail":error.to_string()})),
+    }
+    let pressure = host_snapshot.as_ref().map(|snapshot| {
+        classify_disk(
+            snapshot.volume_free_bytes,
+            snapshot.volume_total_bytes,
+            &config.disk,
+        )
+    });
+    let last_cleanup = read_cleanup_cycle();
+    if compaction_advised(
+        host_snapshot.as_ref(),
+        pressure,
+        last_cleanup
+            .as_ref()
+            .map(|cycle| cycle.cleanup.deleted_logical_bytes)
+            .unwrap_or(0),
+        last_cleanup
+            .as_ref()
+            .and_then(|cycle| cycle.host_free_delta_bytes),
+    ) {
+        warnings.push(
+            "host space cannot be reclaimed by cleanup (non-sparse VHDX); offline compaction is required"
+                .to_owned(),
+        );
+    } else if host_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| !host_reclaim_possible(snapshot))
+    {
+        warnings.push(
+            "non-sparse VHDX: cleanup prevents further growth but does not shrink the physical file"
+                .to_owned(),
+        );
     }
     let ok = checks
         .iter()
@@ -692,6 +805,7 @@ fn doctor(args: OutputArgs) -> Result<i32> {
                 "version": version,
                 "commit": commit,
                 "commit_short": commit_short,
+                "warnings": warnings,
                 "checks": checks
             }))?
         );
@@ -709,20 +823,85 @@ fn doctor(args: OutputArgs) -> Result<i32> {
                 check["detail"]
             );
         }
+        for warning in &warnings {
+            println!("WARN {warning}");
+        }
     }
     Ok(if ok { 0 } else { 1 })
+}
+
+/// Verifies the monitor starts with WSL2: user systemd, linger, and the unit.
+fn boot_integration_check() -> Value {
+    let mut detail = serde_json::Map::new();
+    let mut ok = true;
+
+    let systemd_enabled = std::fs::read_to_string("/etc/wsl.conf")
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .any(|line| line == "systemd=true")
+        })
+        .unwrap_or(false);
+    // On native Linux there is no wsl.conf; treat that as not applicable.
+    let on_wsl = current_platform().is_ok_and(|platform| platform == HostPlatform::Wsl2);
+    let systemd_ok = !on_wsl || systemd_enabled;
+    if !systemd_ok {
+        ok = false;
+    }
+    detail.insert(
+        "systemd".to_owned(),
+        json!({"ok": systemd_ok, "wsl2": on_wsl, "enabled": systemd_enabled}),
+    );
+
+    let linger_enabled = std::fs::metadata(format!(
+        "/var/lib/systemd/linger/{}",
+        std::env::var("USER").unwrap_or_default()
+    ))
+    .is_ok_and(|metadata| metadata.is_file());
+    if !linger_enabled {
+        ok = false;
+    }
+    detail.insert("linger".to_owned(), json!({"ok": linger_enabled}));
+
+    let unit_enabled = std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", "guardwsl.service"])
+        .output()
+        .map(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "enabled"
+        })
+        .unwrap_or(false);
+    if !unit_enabled {
+        ok = false;
+    }
+    detail.insert(
+        "unit".to_owned(),
+        json!({"ok": unit_enabled, "name": "guardwsl.service"}),
+    );
+
+    json!({
+        "name": "boot",
+        "ok": ok,
+        "detail": detail,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MonitorStatus {
     schema_version: u32,
     pid: u32,
-    started_at: DateTime<Utc>,
-    last_cycle_at: DateTime<Utc>,
-    next_maintenance_at: DateTime<Utc>,
-    last_cleanup_at: Option<DateTime<Utc>>,
+    started_at: Timestamp,
+    last_cycle_at: Timestamp,
+    next_maintenance_at: Timestamp,
+    last_cleanup_at: Option<Timestamp>,
     last_pressure: Option<DiskPressure>,
     last_error: Option<String>,
+    #[serde(default)]
+    no_safe_reclaim: bool,
+    #[serde(default)]
+    host_reclaim_possible: Option<bool>,
+    #[serde(default)]
+    compaction_advised: bool,
 }
 
 impl MonitorStatus {
@@ -730,9 +909,9 @@ impl MonitorStatus {
         if self.schema_version != 1 || self.last_error.is_some() || !pid_alive(self.pid) {
             return false;
         }
-        let age = Utc::now()
-            .signed_duration_since(self.last_cycle_at)
-            .num_seconds();
+        let age = Timestamp::now()
+            .duration_since(self.last_cycle_at)
+            .as_secs();
         age >= 0 && age <= i64::try_from(config.monitor.interval_seconds * 4).unwrap_or(i64::MAX)
     }
 }
@@ -750,15 +929,16 @@ fn monitor(args: MonitorArgs) -> Result<i32> {
         bail!("configuration is degraded; monitor failed closed")
     }
     let mut config = loaded.config;
-    let started_at = Utc::now();
+    let started_at = Timestamp::now();
     let mut maintenance_interval = Duration::from_secs(config.monitor.maintenance_interval_seconds);
     let mut next_maintenance = Instant::now() + maintenance_interval;
-    let mut next_pressure_cleanup = Instant::now();
+    let mut last_pressure_cleanup: Option<Instant> = None;
     let mut last_cleanup_at = None;
+    let mut cleanup_error: Option<String> = None;
+    let mut no_safe_reclaim = false;
 
     loop {
-        let cycle_at = Utc::now();
-        let mut last_error = None;
+        let mut last_error = cleanup_error.clone();
         let mut pressure = None;
         let config_ready = match store.load_read_only() {
             Ok(loaded) if !loaded.degraded => {
@@ -782,7 +962,7 @@ fn monitor(args: MonitorArgs) -> Result<i32> {
             }
         };
         let host = config_ready.then(|| probe_host(&config));
-        match host {
+        match host.as_ref() {
             Some(Ok(snapshot)) => {
                 let current = classify_disk(
                     snapshot.volume_free_bytes,
@@ -790,9 +970,12 @@ fn monitor(args: MonitorArgs) -> Result<i32> {
                     &config.disk,
                 );
                 pressure = Some(current);
+                if !matches!(current, DiskPressure::Critical | DiskPressure::Emergency) {
+                    no_safe_reclaim = false;
+                }
                 let need_space =
-                    current != DiskPressure::Healthy || below_target(&config, &snapshot);
-                let pressure_due = need_space && Instant::now() >= next_pressure_cleanup;
+                    current != DiskPressure::Healthy || below_target(&config, snapshot);
+                let pressure_due = pressure_cleanup_due(need_space, last_pressure_cleanup, current);
                 let scheduled_due = !need_space && Instant::now() >= next_maintenance;
                 if config.cleanup.enabled
                     && (pressure_due || scheduled_due)
@@ -811,15 +994,43 @@ fn monitor(args: MonitorArgs) -> Result<i32> {
                                 fresh_pressure,
                                 CleanupMode::Execute,
                                 Some(&fresh_snapshot),
+                                CacheAgePolicy::Retention,
+                                None,
                             ) {
                                 Ok(cycle) if cycle.cleanup.succeeded() => {
-                                    last_cleanup_at = Some(Utc::now());
+                                    last_cleanup_at = Some(Timestamp::now());
+                                    let after_pressure = cycle.host_free_after_bytes.map_or(
+                                        fresh_pressure,
+                                        |free| {
+                                            classify_disk(
+                                                free,
+                                                fresh_snapshot.volume_total_bytes,
+                                                &config.disk,
+                                            )
+                                        },
+                                    );
+                                    no_safe_reclaim = matches!(
+                                        after_pressure,
+                                        DiskPressure::Critical | DiskPressure::Emergency
+                                    ) && cycle.cleanup.deleted_logical_bytes == 0
+                                        && cycle
+                                            .host_free_delta_bytes
+                                            .is_none_or(|delta| delta <= 0);
+                                    cleanup_error = cycle
+                                        .cleanup
+                                        .process_inspection_blocked()
+                                        .then(|| {
+                                            "cleanup could not safely inspect a same-user process"
+                                                .to_owned()
+                                        })
+                                        .or_else(|| cycle.trim_error.clone());
+                                    last_error = cleanup_error.clone();
                                     let still_short = fresh_pressure != DiskPressure::Healthy
                                         || below_target(&config, &fresh_snapshot);
                                     if still_short {
-                                        next_pressure_cleanup = Instant::now()
-                                            + pressure_cleanup_cooldown(fresh_pressure);
+                                        last_pressure_cleanup = Some(Instant::now());
                                     } else {
+                                        last_pressure_cleanup = None;
                                         next_maintenance = Instant::now() + maintenance_interval;
                                     }
                                 }
@@ -832,24 +1043,74 @@ fn monitor(args: MonitorArgs) -> Result<i32> {
                                 Err(error) => last_error = Some(error.to_string()),
                             }
                         }
-                        Err(error) => last_error = Some(error.to_string()),
+                        Err(error) => {
+                            let message = format!("host telemetry unavailable: {error:#}");
+                            pressure = None;
+                            run_unverified_cleanup(
+                                &config,
+                                &message,
+                                &mut last_pressure_cleanup,
+                                &mut last_cleanup_at,
+                                &mut cleanup_error,
+                            );
+                            last_error = Some(telemetry_failure_message(
+                                &message,
+                                cleanup_error.as_deref(),
+                            ));
+                        }
                     }
                 }
             }
-            Some(Err(error)) => last_error = Some(error.to_string()),
+            Some(Err(error)) => {
+                let message = format!("host telemetry unavailable: {error:#}");
+                // A missing measurement blocks claims about host capacity, but
+                // must not disable independently safe retention cleanup.
+                if unknown_host_cleanup_due(config.cleanup.enabled, last_pressure_cleanup)
+                    && let Some(_maintenance) = MaintenanceLock::try_acquire()?
+                {
+                    run_unverified_cleanup(
+                        &config,
+                        &message,
+                        &mut last_pressure_cleanup,
+                        &mut last_cleanup_at,
+                        &mut cleanup_error,
+                    );
+                }
+                last_error = Some(telemetry_failure_message(
+                    &message,
+                    cleanup_error.as_deref(),
+                ));
+            }
             None => {}
         }
         let until_maintenance = next_maintenance.saturating_duration_since(Instant::now());
+        let latest_cycle = read_cleanup_cycle();
+        let advise_compaction = compaction_advised(
+            host.as_ref().and_then(|result| result.as_ref().ok()),
+            pressure,
+            latest_cycle
+                .as_ref()
+                .map(|cycle| cycle.cleanup.deleted_logical_bytes)
+                .unwrap_or(0),
+            latest_cycle
+                .as_ref()
+                .and_then(|cycle| cycle.host_free_delta_bytes),
+        );
         let status = MonitorStatus {
             schema_version: 1,
             pid: std::process::id(),
             started_at,
-            last_cycle_at: cycle_at,
-            next_maintenance_at: Utc::now()
-                + chrono::Duration::from_std(until_maintenance).unwrap_or_default(),
+            last_cycle_at: Timestamp::now(),
+            next_maintenance_at: Timestamp::now().checked_add(until_maintenance)?,
             last_cleanup_at,
             last_pressure: pressure,
+            no_safe_reclaim: no_safe_reclaim && pressure.is_some() && last_error.is_none(),
             last_error,
+            host_reclaim_possible: host
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .map(host_reclaim_possible),
+            compaction_advised: advise_compaction,
         };
         write_monitor_status(&status)?;
         if args.once {
@@ -891,7 +1152,19 @@ fn probe_host(config: &GuardConfig) -> Result<HostSnapshot> {
     let timeout = Duration::from_secs(config.disk.host_probe_timeout_seconds);
     let snapshot = match current_platform()? {
         HostPlatform::Linux => probe_linux_disk(&config.cleanup.scan_roots)?,
-        HostPlatform::Wsl2 => PowerShellHostProbe::new(timeout).probe()?,
+        HostPlatform::Wsl2 => match guardwsl::host_fallback::probe_verified_drvfs() {
+            Ok(snapshot) => snapshot,
+            Err(fallback_error) => {
+                let mut snapshot =
+                    PowerShellHostProbe::new(timeout).probe().with_context(|| {
+                        format!("verified DrvFs fallback unavailable: {fallback_error:#}")
+                    })?;
+                snapshot.source = Some("powershell".to_owned());
+                // Failure to save a fallback never changes a valid live probe.
+                let _ = guardwsl::host_fallback::remember_wsl_host(&snapshot);
+                snapshot
+            }
+        },
     };
     snapshot.require_fresh(timeout.saturating_mul(2))?;
     Ok(snapshot)
@@ -917,10 +1190,61 @@ fn pid_alive(pid: u32) -> bool {
 fn pressure_cleanup_cooldown(pressure: DiskPressure) -> Duration {
     Duration::from_secs(match pressure {
         DiskPressure::Healthy => 15 * 60,
-        DiskPressure::Pressure => 15 * 60,
-        DiskPressure::Critical => 5 * 60,
-        DiskPressure::Emergency => 60,
+        DiskPressure::Pressure => 2 * 60,
+        DiskPressure::Critical => 60,
+        DiskPressure::Emergency => 30,
     })
+}
+
+fn pressure_cleanup_due(need_space: bool, last: Option<Instant>, pressure: DiskPressure) -> bool {
+    need_space && last.is_none_or(|last| last.elapsed() >= pressure_cleanup_cooldown(pressure))
+}
+
+fn unknown_host_cleanup_due(enabled: bool, last: Option<Instant>) -> bool {
+    enabled && pressure_cleanup_due(true, last, DiskPressure::Pressure)
+}
+
+// The caller holds the maintenance lock. Missing telemetry changes accounting,
+// not the ownership, process-use, age, and quarantine checks on each candidate.
+fn run_unverified_cleanup(
+    config: &GuardConfig,
+    message: &str,
+    last_pressure_cleanup: &mut Option<Instant>,
+    last_cleanup_at: &mut Option<Timestamp>,
+    cleanup_error: &mut Option<String>,
+) {
+    match run_cleanup(
+        config,
+        DiskPressure::Pressure,
+        CleanupMode::Execute,
+        None,
+        CacheAgePolicy::Retention,
+        Some(message),
+    ) {
+        Ok(cycle) if cycle.cleanup.succeeded() => {
+            *last_cleanup_at = Some(Timestamp::now());
+            *cleanup_error = cycle
+                .cleanup
+                .process_inspection_blocked()
+                .then(|| "cleanup could not safely inspect a same-user process".to_owned())
+                .or_else(|| cycle.trim_error.clone());
+        }
+        Ok(cycle) => {
+            *cleanup_error = Some(format!(
+                "cleanup finished with {} failures",
+                cycle.cleanup.failures
+            ));
+        }
+        Err(error) => *cleanup_error = Some(format!("cleanup failed: {error:#}")),
+    }
+    *last_pressure_cleanup = Some(Instant::now());
+}
+
+fn telemetry_failure_message(message: &str, cleanup_error: Option<&str>) -> String {
+    cleanup_error.map_or_else(
+        || message.to_owned(),
+        |cleanup_error| format!("{message}; {cleanup_error}"),
+    )
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -937,15 +1261,28 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use guardwsl::cleanup::{CleanupCandidate, CleanupKind, CleanupPlan};
     use guardwsl::config::ConfigOrigin;
+    use guardwsl::host::HostPlatform;
 
     #[test]
-    fn child_exit_status_is_preserved() {
-        let status = ProcessCommand::new("sh")
-            .args(["-c", "exit 23"])
-            .status()
-            .unwrap();
-        assert_eq!(exit_code(status), 23);
+    fn healthy_heartbeat_can_report_critical_pressure_without_safe_reclaim() {
+        let now = Timestamp::now();
+        let config = GuardConfig::default();
+        let mut heartbeat: MonitorStatus = serde_json::from_value(json!({
+            "schema_version": 1, "pid": std::process::id(), "started_at": now,
+            "last_cycle_at": now, "next_maintenance_at": now, "last_cleanup_at": now,
+            "last_pressure": "critical", "last_error": null
+        }))
+        .unwrap();
+        assert!(!heartbeat.no_safe_reclaim);
+        heartbeat.no_safe_reclaim = true;
+        assert!(heartbeat.healthy(&config));
+        heartbeat.last_error = Some("cleanup failed".to_owned());
+        assert!(!heartbeat.healthy(&config));
+        heartbeat.last_error = None;
+        heartbeat.last_cycle_at = now - jiff::SignedDuration::from_hours(24);
+        assert!(!heartbeat.healthy(&config));
     }
 
     #[test]
@@ -955,10 +1292,224 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_host_uses_conservative_cleanup_without_inventing_capacity() {
+        let mut config = GuardConfig::default();
+        assert_eq!(cleanup_pressure(&config, None), DiskPressure::Pressure);
+        assert!(unknown_host_cleanup_due(config.cleanup.enabled, None));
+        assert!(!unknown_host_cleanup_due(
+            config.cleanup.enabled,
+            Some(Instant::now())
+        ));
+        let previous = Instant::now() - Duration::from_secs(121);
+        assert!(unknown_host_cleanup_due(
+            config.cleanup.enabled,
+            Some(previous)
+        ));
+        config.cleanup.enabled = false;
+        assert!(!unknown_host_cleanup_due(config.cleanup.enabled, None));
+    }
+
+    #[test]
+    fn rising_pressure_shortens_the_current_cleanup_cooldown() {
+        let previous = Instant::now() - Duration::from_secs(45);
+        assert!(!pressure_cleanup_due(
+            true,
+            Some(previous),
+            DiskPressure::Pressure
+        ));
+        assert!(!pressure_cleanup_due(
+            true,
+            Some(previous),
+            DiskPressure::Critical
+        ));
+        assert!(pressure_cleanup_due(
+            true,
+            Some(previous),
+            DiskPressure::Emergency
+        ));
+        assert!(!pressure_cleanup_due(
+            false,
+            Some(previous),
+            DiskPressure::Emergency
+        ));
+        assert!(pressure_cleanup_due(true, None, DiskPressure::Pressure));
+    }
+
+    #[test]
+    fn discard_reports_command_failure() {
+        assert!(discard_guest_blocks_with("/bin/sh", &["-c", "exit 0"]).is_ok());
+        assert!(discard_guest_blocks_with("/bin/sh", &["-c", "exit 3"]).is_err());
+    }
+
+    #[test]
+    fn recent_caches_require_an_explicit_manual_flag() {
+        let Command::Clean(default) = Cli::try_parse_from(["guard", "clean"]).unwrap().command
+        else {
+            panic!("expected clean")
+        };
+        assert!(!default.all_caches);
+        let Command::Clean(explicit) =
+            Cli::try_parse_from(["guard", "clean", "--all-caches", "--dry-run", "--json"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected clean")
+        };
+        assert!(explicit.all_caches && explicit.dry_run && explicit.json);
+        assert!(Cli::try_parse_from(["guard", "monitor", "--all-caches"]).is_err());
+        assert!(Cli::try_parse_from(["guard", "status", "--all-caches"]).is_err());
+    }
+
+    #[test]
+    fn forwarding_subcommands_are_not_available() {
+        assert!(Cli::try_parse_from(["guard", "exec", "echo", "hello"]).is_err());
+        assert!(Cli::try_parse_from(["guard", "shim", "npm"]).is_err());
+    }
+
+    #[test]
     fn config_origin_is_serializable() {
         assert_eq!(
             serde_json::to_value(ConfigOrigin::Default).unwrap(),
             json!("default")
         );
+    }
+
+    fn candidate(path: &str, estimated_bytes: u64) -> CleanupCandidate {
+        CleanupCandidate {
+            path: PathBuf::from(path),
+            kind: CleanupKind::JavaScriptCache,
+            repository: None,
+            minimum_age_hours: 1,
+            estimated_bytes,
+            newest_modified_at: Timestamp::now(),
+            device: 1,
+            inode: 1,
+        }
+    }
+
+    fn plan_with_sizes(sizes: &[u64]) -> CleanupPlan {
+        CleanupPlan {
+            created_at: Timestamp::now(),
+            pressure: DiskPressure::Pressure,
+            candidates: sizes
+                .iter()
+                .enumerate()
+                .map(|(index, size)| candidate(&format!("/cache/{index}"), *size))
+                .collect(),
+            skips: Vec::new(),
+        }
+    }
+
+    fn snapshot(sparse: bool, total: u64, free: u64) -> HostSnapshot {
+        HostSnapshot {
+            schema_version: 2,
+            platform: HostPlatform::Wsl2,
+            captured_at: Timestamp::now(),
+            source: None,
+            distro: Some("Ubuntu-24.04".to_owned()),
+            vhdx_path: Some(r"X:\wsl\ext4.vhdx".to_owned()),
+            vhdx_sparse: Some(sparse),
+            vhdx_size_bytes: Some(total - free),
+            volume_root: r"X:\".to_owned(),
+            volume_total_bytes: total,
+            volume_free_bytes: free,
+        }
+    }
+
+    #[test]
+    fn logical_budget_caps_reclaimable_cleanup() {
+        let config = GuardConfig::default();
+        let total = 100 * guardwsl::config::GIB;
+        // 10 GiB free vs 64 GiB default target would budget 54 GiB; use a
+        // smaller gap so the cap is visible.
+        let mut tight = config.clone();
+        tight.disk.target_free_bytes = 12 * guardwsl::config::GIB;
+        let host = snapshot(true, total, 10 * guardwsl::config::GIB);
+        let mut plan = plan_with_sizes(&[
+            3 * guardwsl::config::GIB,
+            3 * guardwsl::config::GIB,
+            3 * guardwsl::config::GIB,
+        ]);
+        apply_logical_budget(&mut plan, &tight, &host, DiskPressure::Pressure, true, true);
+        // Budget = 2 GiB; the first 3 GiB candidate is kept, the rest are not.
+        assert_eq!(plan.candidates.len(), 1);
+    }
+
+    #[test]
+    fn non_sparse_vhdx_skips_the_unreachable_host_budget() {
+        let config = GuardConfig::default();
+        let total = 100 * guardwsl::config::GIB;
+        let mut tight = config.clone();
+        tight.disk.target_free_bytes = 12 * guardwsl::config::GIB;
+        let host = snapshot(false, total, 10 * guardwsl::config::GIB);
+        let mut plan = plan_with_sizes(&[
+            3 * guardwsl::config::GIB,
+            3 * guardwsl::config::GIB,
+            3 * guardwsl::config::GIB,
+        ]);
+        apply_logical_budget(
+            &mut plan,
+            &tight,
+            &host,
+            DiskPressure::Pressure,
+            true,
+            false,
+        );
+        assert_eq!(plan.candidates.len(), 3);
+    }
+
+    #[test]
+    fn healthy_cycles_are_not_budget_capped() {
+        let config = GuardConfig::default();
+        let total = 100 * guardwsl::config::GIB;
+        let host = snapshot(true, total, 10 * guardwsl::config::GIB);
+        let mut plan = plan_with_sizes(&[
+            3 * guardwsl::config::GIB,
+            3 * guardwsl::config::GIB,
+            3 * guardwsl::config::GIB,
+        ]);
+        apply_logical_budget(
+            &mut plan,
+            &config,
+            &host,
+            DiskPressure::Healthy,
+            false,
+            true,
+        );
+        assert_eq!(plan.candidates.len(), 3);
+    }
+
+    #[test]
+    fn emergency_skips_logical_budget_even_on_sparse_vhdx() {
+        let config = GuardConfig::default();
+        let total = 100 * guardwsl::config::GIB;
+        let mut tight = config.clone();
+        tight.disk.target_free_bytes = 12 * guardwsl::config::GIB;
+        let host = snapshot(true, total, 10 * guardwsl::config::GIB);
+        let mut plan = plan_with_sizes(&[
+            3 * guardwsl::config::GIB,
+            3 * guardwsl::config::GIB,
+            3 * guardwsl::config::GIB,
+        ]);
+        apply_logical_budget(
+            &mut plan,
+            &tight,
+            &host,
+            DiskPressure::Emergency,
+            true,
+            true,
+        );
+        assert_eq!(plan.candidates.len(), 3);
+    }
+
+    #[test]
+    fn emergency_lifts_the_action_ceiling() {
+        use guardwsl::cleanup::effective_max_actions;
+        assert_eq!(effective_max_actions(DiskPressure::Healthy, 20), 20);
+        assert_eq!(effective_max_actions(DiskPressure::Pressure, 20), 20);
+        assert_eq!(effective_max_actions(DiskPressure::Critical, 20), 20);
+        assert_eq!(effective_max_actions(DiskPressure::Emergency, 20), 40);
+        assert_eq!(effective_max_actions(DiskPressure::Emergency, 60), 60);
+        assert_eq!(effective_max_actions(DiskPressure::Emergency, 5), 40);
     }
 }

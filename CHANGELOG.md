@@ -49,6 +49,40 @@ and the project intends to use [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed
+
+- `guard exec` and tool shims. Upgrades remove their legacy GuardWSL-marked
+  PATH entries.
+- Retired admission and memory controls are discarded during configuration
+  normalization instead of being parsed as active settings.
+
+### Added
+
+- `Emergency` pressure lifts the per-cycle action ceiling and ignores the
+  logical budget, so regenerable artifacts are cleared before any recovery
+  outside GuardWSL's scope is needed.
+- A dedicated BuildKit builder can be inventoried and its idle build records
+  reclaimed with the opt-in helper. It preserves images, containers and volumes.
+- Host snapshots report `vhdx_size_bytes`, and `guard status` shows VHDX
+  occupancy as physical VHDX size over host volume size — the growth risk
+  metric on WSL2, independent of free bytes.
+- `compaction_advised` is raised by `guard status`, `guard doctor`,
+  `guard clean`, and the monitor when a non-sparse VHDX cannot return host
+  space through cleanup. Cleanup still runs to prevent further growth; the
+  advisory names offline compaction as the recovery step and points at
+  `docs/SAFETY.md`.
+- `guard doctor` verifies boot integration: `systemd=true` in `/etc/wsl.conf`,
+  systemd linger for the current user, and the enabled `guardwsl.service` unit.
+  The installer enables linger so the monitor starts with WSL2, not only at an
+  interactive login.
+
+### Fixed
+
+- The cleanup plan no longer applies a host-free logical budget on a non-sparse
+  VHDX. That budget is unreachable there and under-cleaned exactly when host
+  pressure was highest; `max_actions_per_cycle` and risk order still bound the
+  plan.
+
 ## [0.1.2] - 2026-10-01
 
 ### Added
@@ -94,7 +128,7 @@ and the project intends to use [Semantic Versioning](https://semver.org/).
 - Host-aware disk status for native Linux filesystems and the current WSL2 distribution's physical Windows backing volume.
 - Conservative cleanup with exact allowlists, dry run, revalidation, and audit
   records.
-- Direct forwarding of development commands without build admission.
+- Direct command forwarding through `guard exec` and tool shims.
 - A user-scoped systemd monitor and transactional installer.
 - English canonical documentation and a Portuguese (Brazil) README.
 - Full SHA in `guard --version`, status JSON, and the install record; the

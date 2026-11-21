@@ -1,9 +1,7 @@
 # Release process
 
-GuardWSL releases are **automatic on merge**, the same model as the
-`ramshared` repository: `release-please` maintains the release PR, and
-merging that PR creates the tag, the GitHub release, and the install
-artifacts without any manual `git tag` step.
+`release-please` maintains the release PR. Merging that PR creates the tag,
+the GitHub release and the installation archives.
 
 The hosted `Release` workflow refuses to publish unless every identity
 check passes. There is no manual fallback tag.
@@ -44,7 +42,7 @@ Everything before `0.2.0` stays on the `0.1.x` line only for `fix:`;
 
 1. the tag is `v*` and equals `v` + `Cargo.toml` `version`;
 2. `cargo test --locked` and `bash -n` on the installer scripts pass;
-3. the release binary is built with the pinned toolchain (`1.98.0`);
+3. the release binary is built with the pinned toolchain (`1.100.0`);
 4. `guard --version` reports the release commit **and** the tagged
    package version;
 5. a complete install tree (`guard`, `scripts/`, `systemd/`, docs,
@@ -85,8 +83,10 @@ a PR:
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-bash tests/install_platform.sh tests/install_order.sh
-bash -n scripts/install-linux.sh scripts/install-shims.sh scripts/platform.sh
+bash tests/install_platform.sh
+bash tests/install_order.sh
+bash tests/retire_shims.sh
+bash -n scripts/install-linux.sh scripts/retire-shims.sh scripts/platform.sh
 ```
 
 ## Client verification

@@ -2,7 +2,7 @@
 
 use crate::fsutil::{append_private, default_state_dir, read_private};
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -19,7 +19,7 @@ pub enum AuditOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRecord {
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     pub event: String,
     pub outcome: AuditOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -33,7 +33,7 @@ impl AuditRecord {
     #[must_use]
     pub fn new(event: impl Into<String>, outcome: AuditOutcome, detail: impl Into<String>) -> Self {
         Self {
-            at: Utc::now(),
+            at: Timestamp::now(),
             event: event.into(),
             outcome,
             path: None,

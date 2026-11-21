@@ -21,8 +21,6 @@ GuardWSL is a user-scoped native Linux and WSL2 utility with three responsibilit
 ## Data flow
 
 ```text
-tool shim / guard exec -> resolve tool -> execute child directly
-
 monitor -> fresh host probe -> pressure classification
                             -> exclusive maintenance lock
                             -> cleanup plan and revalidation

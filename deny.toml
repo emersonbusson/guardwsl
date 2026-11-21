@@ -1,4 +1,4 @@
-# GuardWSL supply-chain policy. Run: cargo audit && cargo deny check
+# GuardWSL supply-chain policy. Run: cargo audit && cargo deny --locked check
 
 [graph]
 all-features = true

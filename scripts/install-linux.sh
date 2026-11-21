@@ -27,18 +27,6 @@ if [[ ! -d "$repo_dir/.git" && -f "$repo_dir/guard" && -x "$repo_dir/guard" ]]; 
   release_binary="$repo_dir/guard"
   from_release=true
 fi
-real_tool_path=""
-IFS=: read -r -a path_entries <<<"${PATH:-}"
-for path_entry in "${path_entries[@]}"; do
-  case "$path_entry" in
-    *guardwsl/shims*) continue ;;
-  esac
-  real_tool_path="${real_tool_path:+$real_tool_path:}$path_entry"
-done
-[[ -n "$real_tool_path" ]] || {
-  printf 'The real tool PATH is empty after removing GuardWSL shims.\n' >&2
-  exit 1
-}
 umask 077
 
 if [[ -z "$release_binary" ]]; then
@@ -162,15 +150,15 @@ rollback() {
   fi
   printf 'Installation rolled back. Backup: %s\n' "$backup_root" >&2
 }
-trap rollback ERR
-trap 'rollback; exit 130' INT TERM
-
 cd "$repo_dir"
 if [[ -z "$release_binary" ]]; then
-  PATH="$real_tool_path" "$cargo_bin" test --locked
-  PATH="$real_tool_path" "$cargo_bin" build --release --locked
+  "$cargo_bin" test --locked
+  "$cargo_bin" build --release --locked
   release_binary="$repo_dir/target/release/guard"
 fi
+trap 'result=$?; trap - ERR INT TERM; rollback; exit "$result"' ERR
+trap 'trap - ERR INT TERM; rollback; exit 130' INT
+trap 'trap - ERR INT TERM; rollback; exit 143' TERM
 if [[ "$old_active" == "active" ]]; then
   systemctl --user stop guardwsl.service
 fi
@@ -189,10 +177,23 @@ if [[ "$platform" == wsl2 ]]; then
   chmod 0600 "$distro_tmp"
   mv -f -- "$distro_tmp" "$distro_path"
 fi
-bash "$repo_dir/scripts/install-shims.sh" "$guard_bin"
+bash "$repo_dir/scripts/retire-shims.sh"
 
 systemctl --user daemon-reload
 systemctl --user enable guardwsl.service
+# The monitor must come up with WSL2, not only at interactive login. Linger
+# starts the user manager at boot so guardwsl.service is active immediately.
+if [[ "$platform" == wsl2 ]]; then
+  if [[ ! -e "/var/lib/systemd/linger/$USER" ]]; then
+    if command -v loginctl >/dev/null 2>&1; then
+      loginctl enable-linger "$USER" 2>/dev/null || loginctl enable-linger 2>/dev/null || true
+    fi
+    if [[ ! -e "/var/lib/systemd/linger/$USER" ]]; then
+      printf 'Warning: could not enable systemd linger for %s; the monitor will start at first login only.\n' "$USER" >&2
+      printf 'Run: sudo loginctl enable-linger %s\n' "$USER" >&2
+    fi
+  fi
+fi
 systemctl --user restart guardwsl.service
 
 healthy=false

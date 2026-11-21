@@ -75,33 +75,6 @@ impl GuardConfig {
     }
 }
 
-// Parse-only compatibility for pre-removal schema v1 files. These values have
-// no effect and are not emitted by GuardConfig or shown as active controls.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct AdmissionConfig {
-    pub enabled: bool,
-    pub build_wait_seconds: u64,
-}
-
-impl Default for AdmissionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            build_wait_seconds: 4 * 60 * 60,
-        }
-    }
-}
-
-impl AdmissionConfig {
-    fn validate(&self) -> Result<()> {
-        if !(1..=24 * 60 * 60).contains(&self.build_wait_seconds) {
-            bail!("admission.build_wait_seconds must be between 1 and 86400")
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiskConfig {
@@ -167,31 +140,6 @@ impl DiskConfig {
         }
         if !(1..=30).contains(&self.host_probe_timeout_seconds) {
             bail!("disk.host_probe_timeout_seconds must be between 1 and 30")
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct MemoryConfig {
-    pub host_floor_bytes: u64,
-    pub build_headroom_bytes: u64,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            host_floor_bytes: 8 * GIB,
-            build_headroom_bytes: 4 * GIB,
-        }
-    }
-}
-
-impl MemoryConfig {
-    fn validate(&self) -> Result<()> {
-        if self.host_floor_bytes < 4 * GIB || self.build_headroom_bytes > 32 * GIB {
-            bail!("memory floor/headroom is outside the safe bounds")
         }
         Ok(())
     }
@@ -434,6 +382,28 @@ const LEGACY_TABLES: &[&str] = &[
     "archive",
 ];
 
+/// Retired schema-v1 tables discarded during normalization.
+const RETIRED_TABLES: &[&str] = &["admission", "memory"];
+
+/// Whether `config normalize` must rewrite the file.
+///
+/// A clean schema-v1 document is left untouched so user comments survive
+/// installation and repeated normalization.
+pub fn needs_normalization(text: &str) -> Result<bool> {
+    let document: toml::Value =
+        toml::from_str(text).context("configuration is not a valid TOML document")?;
+    let table = document
+        .as_table()
+        .context("the configuration root must be a TOML table")?;
+    if table.contains_key("version") {
+        return Ok(true);
+    }
+    Ok(LEGACY_TABLES
+        .iter()
+        .chain(RETIRED_TABLES.iter())
+        .any(|key| table.contains_key(*key)))
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct LegacyConfig {
@@ -599,17 +569,8 @@ fn parse_config_text(text: &str, home: Option<&Path>) -> Result<GuardConfig> {
         let table = current
             .as_table_mut()
             .context("the configuration root must be a TOML table")?;
-        if let Some(retired) = table.remove("admission") {
-            let old: AdmissionConfig = retired
-                .try_into()
-                .context("retired admission configuration is invalid")?;
-            old.validate()?;
-        }
-        if let Some(retired) = table.remove("memory") {
-            let old: MemoryConfig = retired
-                .try_into()
-                .context("retired memory configuration is invalid")?;
-            old.validate()?;
+        for retired in RETIRED_TABLES {
+            table.remove(*retired);
         }
         current
             .try_into()
@@ -644,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_preserve_cleanup_without_retired_build_policy() {
+    fn defaults_preserve_cleanup_without_retired_resource_tables() {
         let config = test_default();
         assert!(config.cleanup.enabled);
         assert_eq!(
@@ -673,17 +634,15 @@ mod tests {
     }
 
     #[test]
-    fn retired_build_policy_is_read_but_not_reemitted() {
+    fn retired_resource_tables_are_discarded_without_changing_cleanup() {
         let old = r#"
 schema_version = 1
 
 [admission]
 enabled = true
-build_wait_seconds = 7200
 
 [memory]
 host_floor_bytes = 10737418240
-build_headroom_bytes = 1073741824
 
 [cleanup]
 scan_roots = ["/home/guard-test"]
@@ -698,18 +657,11 @@ cache_min_age_hours = 48
     }
 
     #[test]
-    fn malformed_retired_build_policy_remains_invalid() {
-        let invalid = "schema_version = 1\n[admission]\nbuild_wait_seconds = 0\n";
-        assert!(parse_config_text(invalid, Some(Path::new("/home/guard-test"))).is_err());
-    }
-
-    #[test]
-    fn retired_policy_normalization_preserves_cleanup_settings() {
+    fn retired_resource_normalization_preserves_cleanup_settings() {
         let (_directory, store) = store();
         let mut old = test_default().to_toml().unwrap();
-        old.push_str("\n[admission]\nenabled = true\nbuild_wait_seconds = 7200\n");
+        old.push_str("\n[admission]\nenabled = true\n");
         old.push_str("\n[memory]\nhost_floor_bytes = 10737418240\n");
-        old.push_str("build_headroom_bytes = 1073741824\n");
         atomic_write_private(&store.paths.user, old.as_bytes()).unwrap();
 
         let loaded = store.load_read_only().unwrap();
@@ -755,6 +707,24 @@ cache_min_age_hours = 48
         let mut config = test_default();
         config.disk.critical_free_bytes = config.disk.pressure_free_bytes;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn clean_schema_v1_needs_no_normalization() {
+        let text = test_default().to_toml().unwrap();
+        assert!(!needs_normalization(&text).unwrap());
+        let commented = format!("# user note\n{text}");
+        assert!(!needs_normalization(&commented).unwrap());
+    }
+
+    #[test]
+    fn legacy_and_retired_tables_require_normalization() {
+        assert!(needs_normalization("version = 1\n[reserve]\nhard_reserve_bytes = 1\n").unwrap());
+        assert!(needs_normalization("schema_version = 1\n[admission]\nenabled = false\n").unwrap());
+        assert!(
+            needs_normalization("schema_version = 1\n[memory]\nhost_floor_bytes = 1\n").unwrap()
+        );
+        assert!(needs_normalization("schema_version = 1\n[scan]\nroots = []\n").unwrap());
     }
 
     #[test]
@@ -843,15 +813,15 @@ enabled = true
     }
 
     #[test]
-    fn new_schema_remains_strict_and_never_falls_back_on_invalid_values() {
-        let unknown_field = r#"
+    fn retired_tables_are_ignored_and_invalid_active_values_are_rejected() {
+        let retired_table = r#"
 schema_version = 1
 
 [admission]
 enabled = true
 unexpected = true
 "#;
-        assert!(parse_config_text(unknown_field, Some(Path::new("/home/guard-test"))).is_err());
+        assert!(parse_config_text(retired_table, Some(Path::new("/home/guard-test"))).is_ok());
 
         let invalid_value = r#"
 schema_version = 1

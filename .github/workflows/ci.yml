@@ -25,19 +25,25 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned Rust toolchain
-        run: |
-          rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
-          rustup default 1.98.0
+        run: rustup toolchain install --no-self-update
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Run Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --locked
+      - name: Check live process ownership with read-only sudo
+        run: |
+          cargo test --locked --lib cleanup::tests:: -- --ignored
+      - name: Test BuildKit candidate selection
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
       - name: Run installer tests
-        run: bash tests/install_platform.sh tests/install_order.sh
+        run: |
+          bash tests/install_platform.sh
+          bash tests/install_order.sh
+          bash tests/retire_shims.sh
       - name: Validate shell scripts
-        run: bash -n scripts/install-linux.sh scripts/install-shims.sh scripts/platform.sh
+        run: for script in scripts/*.sh; do bash -n "$script"; done
 
   supply-chain:
     name: Supply-chain policy
@@ -47,9 +53,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned Rust toolchain
-        run: |
-          rustup toolchain install 1.98.0 --profile minimal
-          rustup default 1.98.0
+        run: rustup toolchain install --no-self-update
       - name: Install pinned policy tools
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
@@ -57,4 +61,4 @@ jobs:
       - name: Audit dependencies
         run: cargo audit --deny warnings
       - name: Check dependency policy
-        run: cargo deny check
+        run: cargo deny --locked check

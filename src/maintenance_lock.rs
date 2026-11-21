@@ -1,4 +1,4 @@
-//! Exclusive lock between cleanup cycles; development commands never use it.
+//! Exclusive lock that serializes cleanup cycles.
 
 use crate::fsutil::{effective_uid, flock_file};
 use anyhow::{Context, Result, bail};

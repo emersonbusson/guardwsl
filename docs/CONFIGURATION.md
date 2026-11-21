@@ -22,11 +22,10 @@ guard config validate
 Edit the TOML file with a normal text editor, then run `guard config validate`.
 Unknown fields and invalid values are rejected.
 
-Current-schema files may still contain `[admission]` and `[memory]` from the
-retired build gate. GuardWSL validates their old shape when reading for safe
-migration, but neither table affects commands or appears in `guard config show`.
-`guard config normalize` removes these tables while preserving active disk,
-cleanup, and monitor settings.
+Normalization discards retired top-level tables from older configuration
+versions while preserving current settings. Only fields in the current schema
+control cleanup and monitoring; configuration normalization never deletes
+files.
 
 Older legacy files using `version = 1` may also contain tables such as
 `[scan]`, `[categories]`, `[intervals]`, `[reserve]`, `[workloads]`,
@@ -86,8 +85,7 @@ All sizes are bytes. Thresholds must satisfy:
 emergency < critical < pressure < target
 ```
 
-On native Linux GuardWSL probes the filesystem containing `scan_roots`; all roots must be on one filesystem. On WSL2 it discovers the Windows backing volume for the current distribution. The byte thresholds are upper bounds: effective emergency, critical, pressure, and target thresholds are capped at 5%, 10%, 20%, and 30% of observed total capacity respectively. This prevents small disks from remaining permanently in pressure. The thresholds classify disk pressure and bound cleanup selection; they never block
-or queue a development command. No drive letter or VHDX path belongs in this
+On native Linux GuardWSL probes the filesystem containing `scan_roots`; all roots must be on one filesystem. On WSL2 it discovers the Windows backing volume for the current distribution. The byte thresholds are upper bounds: effective emergency, critical, pressure, and target thresholds are capped at 5%, 10%, 20%, and 30% of observed total capacity respectively. This prevents small disks from remaining permanently in pressure. The thresholds classify disk pressure and bound cleanup selection. No drive letter or VHDX path belongs in this
 configuration.
 
 ## Cleanup roots and protection
@@ -107,8 +105,14 @@ space and may compress category age requirements, but never below
 `critical_min_age_hours`. It still applies every ownership, Git, mount,
 file-type, hard-link, process-use, and identity check.
 
-Set `cleanup.enabled = false` to disable automatic and explicit cleanup without
-affecting command forwarding.
+For an explicit one-time cleanup of recent caches, use
+`guard clean --all-caches --dry-run`, review the candidates, then remove
+`--dry-run` to execute. This bypasses cache age and the host-target logical
+budget without changing any configured value. Build and `node_modules` ages,
+the action ceiling, and all safety checks remain enforced. The monitor never
+uses this override. Zero remains invalid for configured age fields.
+
+Set `cleanup.enabled = false` to disable automatic and explicit cleanup.
 
 ## Monitor
 
@@ -117,3 +121,17 @@ due when free space is below `target_free_bytes` or pressure is worse than
 Healthy (subject to a bounded cooldown), or when the scheduled maintenance
 interval has elapsed. Scheduled maintenance runs every
 `maintenance_interval_seconds`.
+The pressure cooldown is recalculated from the current level on every probe:
+2 minutes under pressure, 1 minute when critical, and 30 seconds in an
+emergency. A sudden escalation does not wait for the previous, longer interval.
+If critical space cannot be recovered safely, monitor health reports that fact.
+
+On WSL2, GuardWSL may use a private same-boot identity captured by a successful
+Windows probe to read live host-volume capacity through its verified DrvFs
+mount. `guard status --json` reports `host.source` as `verified_drvfs`.
+Unsupported or changed identities require a fresh Windows probe. This is a
+host-space reading, not Linux guest free space.
+
+If a same-user process hides its `/proc` information, non-interactive `sudo`
+may be used only to inspect it. Without this read-only fallback, affected
+candidates remain untouched and the monitor reports the inspection failure.

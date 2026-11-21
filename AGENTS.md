@@ -11,5 +11,4 @@
 - Report logical bytes removed separately from physical host space observed. With WSL sparse VHD enabled, Linux deletion may return host blocks gradually; Guard must never claim instant physical reclaim.
 - On native Linux, available space on the scan roots' local filesystem is authoritative. On WSL2, host physical free space is authoritative and guest `df` is diagnostic only. Discover the current distribution backing volume dynamically and never hardcode a drive letter.
 - Invalid configuration fails closed and preserves the last-known-good configuration. Destructive tests use isolated temporary directories only.
-- Shims and `guard exec` forward every command directly. GuardWSL never serializes or blocks development commands based on host telemetry, disk pressure, or cleanup state.
 - Every user-visible behavior and recovery procedure stays documented in this repository. GuardWSL does not own application-domain policy.

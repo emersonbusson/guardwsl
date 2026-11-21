@@ -6,8 +6,7 @@ Idioma: [English](README.md)
 > canônica para comportamento, requisitos e limites de segurança.
 
 GuardWSL é uma ferramenta pequena e restrita ao usuário para proteger máquinas
-de desenvolvimento com Linux nativo ou WSL2. Ela observa o filesystem local no Linux nativo ou o volume físico do Windows que contém a distribuição WSL2 atual, remove somente artefatos comprovadamente regeneráveis e
-não controla comandos de desenvolvimento.
+de desenvolvimento com Linux nativo ou WSL2. Ela observa o filesystem local no Linux nativo ou o volume físico do Windows que contém a distribuição WSL2 atual e remove somente artefatos comprovadamente regeneráveis.
 
 O desenho é deliberadamente conservador: na dúvida, os dados são preservados.
 
@@ -31,8 +30,7 @@ qualquer máquina.
 3. Uma allowlist exata permite limpar somente caches e artefatos conhecidos
    após validar proprietário, Git, idade, mount, tipo, hard links, uso por
    processo e identidade.
-4. Shims e `guard exec` encaminham builds e demais comandos diretamente.
-5. Toda intenção e resultado de limpeza entra em um log JSONL privado.
+4. Toda intenção e resultado de limpeza entra em um log JSONL privado.
 
 GuardWSL **não** executa serviço Windows, controla Hyper-V, compacta ou converte
 VHDX, encerra o WSL, executa `drop_caches`, limpa Docker, gerencia cgroups ou
@@ -49,7 +47,7 @@ Requisitos:
 - Linux nativo ou WSL2 com systemd habilitado;
 - no WSL2, interoperabilidade com Windows PowerShell;
 - Bash. Um release pré-compilado não precisa de Rust; build a partir do
-  código-fonte precisa de Rust 1.98.0 e Cargo.
+  código-fonte precisa de Rust 1.100.0 e Cargo.
 
 ### Instalar a partir de um release (recomendado para clientes)
 
@@ -101,17 +99,30 @@ guard doctor                           # Verifica a sonda de disco correspondent
 guard status                           # Inspeciona pressão no disco do host
 guard clean --dry-run                  # Simula a limpeza sem apagar nenhum arquivo
 guard clean                            # Executa limpeza segura restrita à allowlist sob demanda
+guard clean --all-caches --dry-run     # Simula limpeza incluindo caches recentes
+guard clean --all-caches               # Inclui caches recentes na limpeza manual
 guard config show                      # Exibe a configuração e limites ativos
 guard config init                      # Cria ou reinicia ~/.config/guardwsl/config.toml
 guard config validate                  # Valida a sintaxe e os limites da configuração
 guard history                          # Exibe o histórico de auditoria das limpezas
-guard exec -- <comando> [args...]      # Encaminha um comando diretamente
 ```
 
 ### Notas importantes de configuração
 
-- **Comandos de desenvolvimento:** shims e `guard exec` encaminham comandos diretamente, sem fila ou bloqueio.
 - **Limites personalizados:** ajuste pressão de disco, raízes e caminhos protegidos em `~/.config/guardwsl/config.toml`.
+- Uma atualização remove shims antigos gerenciados pelo GuardWSL e suas entradas marcadas no `PATH`.
+- **Telemetria do host indisponível:** o monitor informa falha e continua a
+  limpeza conservadora por idade sem inventar espaço físico livre. A limpeza
+  manual também funciona e retorna código diferente de zero até a telemetria
+  voltar. As verificações de segurança dos candidatos continuam obrigatórias.
+
+`--all-caches` dispensa a idade mínima somente dos caches permitidos de
+pacotes, compiladores, ferramentas e projetos. Mantém a retenção de builds
+e `node_modules`, os caminhos protegidos, a recusa de processos ativos e todas
+as demais verificações. A opção ignora o orçamento lógico da meta de espaço,
+mas mantém o teto de ações; revise e repita o ciclo se sobrarem candidatos por
+esse limite. Não altera a configuração nem a manutenção automática. Os caches
+removidos serão recriados quando as ferramentas precisarem deles.
 
 ## Escopo exato da limpeza
 
@@ -135,18 +146,13 @@ de credenciais e controle, como `.ssh`, `.gnupg`, `.config`, `.aws`, `.azure`,
 
 Leia o [modelo de segurança](docs/SAFETY.md) antes de ativar limpeza real.
 
-## Comandos de desenvolvimento
-
-O GuardWSL observa a pressão no disco físico para status e decisões de limpeza. Builds e
-demais comandos são encaminhados diretamente, sem fila, lock ou preflight.
-
 ## Disco do host e VHDX sparse
 
 No Linux nativo, é autoritativo o espaço disponível no filesystem local das raízes configuradas; raízes em filesystems distintos são rejeitadas. No WSL2, o espaço físico livre do Windows é autoritativo. O `df` do guest é apenas
 diagnóstico, pois um VHDX ext4 dinâmico pode informar capacidade virtual livre
 enquanto o volume físico do Windows está quase cheio.
 
-Os limites de pressão são limitados proporcionalmente à capacidade observada, para que um disco pequeno não permaneça sempre sob pressão. Os valores configurados em bytes continuam sendo limites superiores. A limpeza é limitada pela meta efetiva e nunca bloqueia comandos de desenvolvimento.
+Os limites de pressão são limitados proporcionalmente à capacidade observada, para que um disco pequeno não permaneça sempre sob pressão. Os valores configurados em bytes continuam sendo limites superiores. A limpeza normal usa a meta efetiva; `--all-caches` e pressão de emergência ignoram esse orçamento lógico. Todos os modos mantêm o teto de ações.
 
 `sparseVhd=true` na `.wslconfig` vale automaticamente para VHDs novos; isso não
 prova que um VHDX existente está sparse. GuardWSL consulta o atributo real e
@@ -173,7 +179,9 @@ não possui os checkouts irmãos para verificar.
 - **`guard status` mostra `Host: unavailable`.** No WSL2, verifique se a
   interoperabilidade com Windows PowerShell funciona
   (`powershell.exe -NoProfile -Command 'echo ok'`). No Linux nativo, confira
-  se toda entrada de `scan_roots` existe e está em um único filesystem.
+  se toda entrada de `scan_roots` existe e está em um único filesystem. A
+  limpeza segura por retenção continua sem meta observada no host, mas não
+  garante espaço físico livre até identificar novamente o volume de origem.
   `guard doctor` nomeia a verificação que falhou.
 - **O disco continua cheio depois da limpeza.** O GuardWSL reporta bytes
   lógicos removidos separadamente do espaço físico livre no host. Um VHDX
@@ -187,7 +195,7 @@ não possui os checkouts irmãos para verificar.
 - **`sha256sum -c SHA256SUMS` falha.** Baixe os dois arquivos de novo; não
   instale um release que não verifique.
 - **O instalador pede Cargo.** Você está em um checkout de código-fonte.
-  Instale o Rust 1.98.0 ou use um tarball de release, que já inclui o binário.
+  Instale o Rust 1.100.0 ou use um tarball de release, que já inclui o binário.
 
 ## Desenvolvimento
 
@@ -195,10 +203,12 @@ não possui os checkouts irmãos para verificar.
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-bash tests/install_platform.sh tests/install_order.sh
+bash tests/install_platform.sh
+bash tests/install_order.sh
+bash tests/retire_shims.sh
 cargo audit --deny warnings
-cargo deny check
-bash -n scripts/install-linux.sh scripts/install-shims.sh
+cargo deny --locked check
+bash -n scripts/install-linux.sh scripts/retire-shims.sh
 ```
 
 Testes destrutivos usam somente diretórios temporários isolados. Eles nunca

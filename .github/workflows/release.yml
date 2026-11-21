@@ -1,6 +1,6 @@
 name: Release
 
-# ramshared-style automatic release:
+# Automatic release on merge
 #   merge to main  -> release-please opens/updates the release PR
 #   merge that PR  -> release-please creates the vX.Y.Z tag + GitHub release,
 #                     and this workflow builds and attaches the install tree
@@ -133,9 +133,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install pinned Rust toolchain
-        run: |
-          rustup toolchain install 1.98.0 --profile minimal
-          rustup default 1.98.0
+        run: rustup toolchain install --no-self-update
 
       - name: Verify tag matches Cargo.toml
         env:
@@ -161,7 +159,7 @@ jobs:
         run: cargo test --locked
 
       - name: Validate installer scripts
-        run: bash -n scripts/install-linux.sh scripts/install-shims.sh scripts/platform.sh
+        run: bash -n scripts/install-linux.sh scripts/retire-shims.sh scripts/platform.sh
 
       - name: Build release binary
         run: cargo build --release --locked
@@ -196,7 +194,7 @@ jobs:
           cp target/release/guard "${staging_dir}/guard"
           chmod 0755 "${staging_dir}/guard"
           cp scripts/install-linux.sh "${staging_dir}/scripts/"
-          cp scripts/install-shims.sh "${staging_dir}/scripts/"
+          cp scripts/retire-shims.sh "${staging_dir}/scripts/"
           cp scripts/platform.sh "${staging_dir}/scripts/"
           chmod 0755 "${staging_dir}/scripts/"*.sh
           cp systemd/guardwsl.service "${staging_dir}/systemd/"

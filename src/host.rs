@@ -3,14 +3,16 @@
 use crate::config::DiskConfig;
 use crate::fsutil::{default_state_dir, read_private};
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CString, OsStr};
 use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,6 +34,26 @@ $vhdxPath = Join-Path -Path $basePath -ChildPath 'ext4.vhdx'
 if (-not (Test-Path -LiteralPath $vhdxPath -PathType Leaf)) { throw "ext4.vhdx is missing: $vhdxPath" }
 $vhdxItem = Get-Item -LiteralPath $vhdxPath
 $vhdxSparse = [bool]($vhdxItem.Attributes -band [System.IO.FileAttributes]::SparseFile)
+# FileInfo.Length includes holes in a sparse VHDX. The volume probe remains
+# usable when Windows policy prevents querying the allocation of this file.
+$vhdxSize = $null
+try {
+  Add-Type -Namespace GuardWSL -Name FileAllocation -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+private static extern uint GetCompressedFileSizeW(string path, out uint high);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", ExactSpelling = true)]
+private static extern void SetLastError(uint error);
+public static ulong Read(string path) {
+    uint high;
+    SetLastError(0);
+    uint low = GetCompressedFileSizeW(path, out high);
+    int error = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+    if (low == uint.MaxValue && error != 0) throw new System.ComponentModel.Win32Exception(error);
+    return ((ulong)high << 32) | low;
+}
+'@
+  $vhdxSize = [GuardWSL.FileAllocation]::Read($vhdxItem.FullName)
+} catch { $vhdxSize = $null }
 try {
   $volume = Get-Volume -FilePath $vhdxPath -ErrorAction Stop
   $volumeRoot = if ($volume.DriveLetter) { "$($volume.DriveLetter):\" } else { [string]$volume.Path }
@@ -51,12 +73,16 @@ try {
   distro = $distroName
   vhdx_path = $vhdxPath
   vhdx_sparse = $vhdxSparse
+  vhdx_size_bytes = $vhdxSize
   volume_root = $volumeRoot
   volume_total_bytes = $volumeSize
   volume_free_bytes = $volumeFree
 } | ConvertTo-Json -Compress
 "#;
 const MAX_PROBE_OUTPUT_BYTES: usize = 1024 * 1024;
+static PENDING_HOST_PROBES: AtomicUsize = AtomicUsize::new(0);
+static PENDING_CLEANUP_COMMANDS: AtomicUsize = AtomicUsize::new(0);
+static PENDING_TRIMS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,13 +115,17 @@ pub fn current_platform() -> Result<HostPlatform> {
 pub struct HostSnapshot {
     pub schema_version: u32,
     pub platform: HostPlatform,
-    pub captured_at: DateTime<Utc>,
+    pub captured_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distro: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vhdx_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vhdx_sparse: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vhdx_size_bytes: Option<u64>,
     pub volume_root: String,
     pub volume_total_bytes: u64,
     pub volume_free_bytes: u64,
@@ -121,13 +151,20 @@ impl HostSnapshot {
                         && self.vhdx_sparse.is_some()
                 }),
             HostPlatform::Linux => {
-                self.distro.is_none() && self.vhdx_path.is_none() && self.vhdx_sparse.is_none()
+                self.distro.is_none()
+                    && self.vhdx_path.is_none()
+                    && self.vhdx_sparse.is_none()
+                    && self.vhdx_size_bytes.is_none()
             }
         };
         if !wsl_identity_valid {
             bail!("host snapshot has invalid platform identity")
         }
         if self.volume_root.chars().any(char::is_control)
+            || self
+                .source
+                .as_ref()
+                .is_some_and(|value| value.chars().any(char::is_control))
             || self
                 .distro
                 .as_ref()
@@ -143,15 +180,12 @@ impl HostSnapshot {
     }
 
     pub fn require_fresh(&self, max_age: Duration) -> Result<()> {
-        let age = Utc::now().signed_duration_since(self.captured_at);
-        const MAX_CLOCK_SKEW_MILLISECONDS: i64 = 5_000;
-        let age_milliseconds = age.num_milliseconds();
-        if age_milliseconds < -MAX_CLOCK_SKEW_MILLISECONDS
-            || (age_milliseconds >= 0
-                && u64::try_from(age_milliseconds).unwrap_or(u64::MAX)
-                    > u64::try_from(max_age.as_millis()).unwrap_or(u64::MAX))
-        {
-            bail!("host snapshot is stale: {} ms", age.num_milliseconds())
+        let age = Timestamp::now().duration_since(self.captured_at);
+        const MAX_CLOCK_SKEW_MILLISECONDS: i128 = 5_000;
+        let age_milliseconds = age.as_millis();
+        let max_age_milliseconds = i128::try_from(max_age.as_millis()).unwrap_or(i128::MAX);
+        if !(-MAX_CLOCK_SKEW_MILLISECONDS..=max_age_milliseconds).contains(&age_milliseconds) {
+            bail!("host snapshot is stale: {age_milliseconds} ms")
         }
         Ok(())
     }
@@ -190,6 +224,57 @@ pub fn classify_disk(free_bytes: u64, total_bytes: u64, config: &DiskConfig) -> 
     } else {
         DiskPressure::Healthy
     }
+}
+
+/// Fraction of the Windows volume occupied by the backing VHDX at which
+/// offline compaction becomes the dominant risk, independent of free bytes.
+pub const VHDX_OCCUPANCY_ADVISORY: f64 = 0.75;
+
+/// Whether deleting Linux files can return physical bytes to the host volume.
+///
+/// Native Linux deletion reclaims the local filesystem directly. On WSL2 a
+/// sparse VHDX may return host blocks gradually; a non-sparse VHDX never
+/// shrinks on delete, so logical cleanup cannot reclaim host space at all.
+#[must_use]
+pub fn host_reclaim_possible(snapshot: &HostSnapshot) -> bool {
+    match snapshot.platform {
+        HostPlatform::Linux => true,
+        HostPlatform::Wsl2 => snapshot.vhdx_sparse != Some(false),
+    }
+}
+
+/// VHDX physical size as a fraction of the backing Windows volume.
+#[must_use]
+pub fn vhdx_occupancy_ratio(snapshot: &HostSnapshot) -> Option<f64> {
+    let size = snapshot.vhdx_size_bytes?;
+    if snapshot.volume_total_bytes == 0 {
+        return None;
+    }
+    Some(size as f64 / snapshot.volume_total_bytes as f64)
+}
+
+/// True when host space cannot be recovered by cleanup alone and the user must
+/// compact the VHDX offline. GuardWSL never compacts, converts, or shuts down
+/// WSL; this is an advisory so pressure is not mistaken for a cleanup failure.
+#[must_use]
+pub fn compaction_advised(
+    snapshot: Option<&HostSnapshot>,
+    pressure: Option<DiskPressure>,
+    deleted_logical_bytes: u64,
+    host_free_delta_bytes: Option<i64>,
+) -> bool {
+    let Some(snapshot) = snapshot else {
+        return false;
+    };
+    if host_reclaim_possible(snapshot) {
+        return false;
+    }
+    let high_occupancy =
+        vhdx_occupancy_ratio(snapshot).is_some_and(|ratio| ratio >= VHDX_OCCUPANCY_ADVISORY);
+    let under_pressure = pressure.is_some_and(|current| current != DiskPressure::Healthy);
+    let useless_reclaim =
+        deleted_logical_bytes > 0 && host_free_delta_bytes.is_none_or(|delta| delta <= 0);
+    under_pressure || high_occupancy || useless_reclaim
 }
 
 pub fn probe_linux_disk(scan_roots: &[PathBuf]) -> Result<HostSnapshot> {
@@ -234,10 +319,12 @@ pub fn probe_linux_disk(scan_roots: &[PathBuf]) -> Result<HostSnapshot> {
     let snapshot = HostSnapshot {
         schema_version: 2,
         platform: HostPlatform::Linux,
-        captured_at: Utc::now(),
+        captured_at: Timestamp::now(),
+        source: None,
         distro: None,
         vhdx_path: None,
         vhdx_sparse: None,
+        vhdx_size_bytes: None,
         volume_root: canonical
             .to_str()
             .context("scan root is not UTF-8")?
@@ -294,11 +381,14 @@ impl PowerShellHostProbe {
                 normalize_windows_text(&output.stderr)
             )
         }
+        if output.stdout_truncated || output.stderr_truncated {
+            bail!("PowerShell probe output exceeded the capture limit")
+        }
         parse_snapshot(&output.stdout)
     }
 }
 
-fn current_distro_name() -> Result<String> {
+pub(crate) fn current_distro_name() -> Result<String> {
     if let Ok(distro) = std::env::var("WSL_DISTRO_NAME") {
         return validate_distro_name(distro);
     }
@@ -391,6 +481,8 @@ pub struct BoundedOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
 pub fn run_bounded<I, S>(
@@ -403,6 +495,59 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_bounded_inner(
+        program,
+        args,
+        timeout,
+        environment,
+        MAX_PROBE_OUTPUT_BYTES,
+        &PENDING_HOST_PROBES,
+    )
+}
+
+pub(crate) fn run_bounded_cleanup_command<I, S>(
+    program: &str,
+    args: I,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<BoundedOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_bounded_inner(
+        program,
+        args,
+        timeout,
+        &[],
+        output_limit,
+        &PENDING_CLEANUP_COMMANDS,
+    )
+}
+
+pub fn run_bounded_trim<I, S>(program: &str, args: I, timeout: Duration) -> Result<BoundedOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_bounded_inner(program, args, timeout, &[], 64 * 1024, &PENDING_TRIMS)
+}
+
+fn run_bounded_inner<I, S>(
+    program: &str,
+    args: I,
+    timeout: Duration,
+    environment: &[(&str, &str)],
+    output_limit: usize,
+    pending: &'static AtomicUsize,
+) -> Result<BoundedOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    if pending.load(Ordering::Acquire) != 0 {
+        bail!("a previous timed-out {program} process is still being reaped")
+    }
     let mut command = Command::new(program);
     command
         .args(args)
@@ -415,60 +560,135 @@ where
     let mut child = command
         .spawn()
         .with_context(|| format!("could not start {program}"))?;
-    let stdout_reader = child
-        .stdout
-        .take()
-        .map(|stream| thread::spawn(move || read_capped(stream, MAX_PROBE_OUTPUT_BYTES)));
-    let stderr_reader = child
-        .stderr
-        .take()
-        .map(|stream| thread::spawn(move || read_capped(stream, MAX_PROBE_OUTPUT_BYTES)));
+    let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        abandon_child(child, pending);
+        bail!("{program} did not provide output pipes")
+    };
+    if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
+        abandon_child(child, pending);
+        return Err(error).context("could not configure nonblocking output pipes");
+    }
+    let mut stdout_data = Vec::new();
+    let mut stderr_data = Vec::new();
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    let mut status = None;
     let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+    loop {
+        if !stdout_closed {
+            match drain_nonblocking(
+                &mut stdout,
+                &mut stdout_data,
+                output_limit,
+                &mut stdout_truncated,
+            ) {
+                Ok(closed) => stdout_closed = closed,
+                Err(error) => {
+                    if status.is_none() {
+                        abandon_child(child, pending);
+                    }
+                    return Err(error).context("could not read process stdout");
+                }
+            }
+        }
+        if !stderr_closed {
+            match drain_nonblocking(
+                &mut stderr,
+                &mut stderr_data,
+                output_limit,
+                &mut stderr_truncated,
+            ) {
+                Ok(closed) => stderr_closed = closed,
+                Err(error) => {
+                    if status.is_none() {
+                        abandon_child(child, pending);
+                    }
+                    return Err(error).context("could not read process stderr");
+                }
+            }
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(result) => status = result,
+                Err(error) => {
+                    abandon_child(child, pending);
+                    return Err(error).context("could not check process status");
+                }
+            }
+        }
+        if let Some(status) = status
+            && stdout_closed
+            && stderr_closed
+        {
+            return Ok(BoundedOutput {
+                status,
+                stdout: stdout_data,
+                stderr: stderr_data,
+                stdout_truncated,
+                stderr_truncated,
+            });
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
+            if status.is_none() {
+                abandon_child(child, pending);
+            }
             bail!("{program} exceeded the {timeout:?} timeout")
         }
-        thread::sleep(Duration::from_millis(50));
-    };
-    let stdout = join_reader(stdout_reader, "stdout")?;
-    let stderr = join_reader(stderr_reader, "stderr")?;
-    Ok(BoundedOutput {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-fn read_capped<R: Read>(mut reader: R, limit: usize) -> io::Result<Vec<u8>> {
-    let mut output = Vec::with_capacity(limit.min(8192));
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        let remaining = limit.saturating_sub(output.len());
-        output.extend_from_slice(&buffer[..read.min(remaining)]);
+        thread::sleep(Duration::from_millis(10));
     }
-    Ok(output)
 }
 
-fn join_reader(
-    reader: Option<thread::JoinHandle<io::Result<Vec<u8>>>>,
-    stream: &str,
-) -> Result<Vec<u8>> {
-    let Some(reader) = reader else {
-        return Ok(Vec::new());
-    };
-    reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("{stream} reader panicked"))?
-        .with_context(|| format!("could not read {stream}"))
+fn set_nonblocking(stream: &impl AsRawFd) -> io::Result<()> {
+    let fd = stream.as_raw_fd();
+    // SAFETY: fcntl only reads and changes flags on the live pipe descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is valid and the flags retain every preexisting bit.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain_nonblocking<R: Read>(
+    reader: &mut R,
+    output: &mut Vec<u8>,
+    limit: usize,
+    truncated: &mut bool,
+) -> io::Result<bool> {
+    let mut buffer = [0_u8; 8192];
+    for _ in 0..16 {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(read) => {
+                let remaining = limit.saturating_sub(output.len());
+                output.extend_from_slice(&buffer[..read.min(remaining)]);
+                *truncated |= read > remaining;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+fn abandon_child(mut child: Child, pending: &'static AtomicUsize) {
+    let _ = child.kill();
+    pending.fetch_add(1, Ordering::AcqRel);
+    // A child stuck in uninterruptible sleep must not stall cleanup. If a
+    // reaper cannot be created, the nonzero count deliberately prevents more
+    // subprocesses from accumulating in this process.
+    let _ = thread::Builder::new()
+        .name("guard-process-reaper".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+            pending.fetch_sub(1, Ordering::AcqRel);
+        });
 }
 
 fn parse_snapshot(bytes: &[u8]) -> Result<HostSnapshot> {
@@ -524,6 +744,7 @@ mod tests {
           "distro":"Example-WSL",
           "vhdx_path":"X:\\WSL\\Example-WSL\\ext4.vhdx",
           "vhdx_sparse":false,
+          "vhdx_size_bytes":123456789,
           "volume_root":"X:\\",
           "volume_total_bytes":1000,
           "volume_free_bytes":500
@@ -536,21 +757,133 @@ mod tests {
     }
 
     #[test]
+    fn wsl2_snapshot_requires_vhdx_physical_size() {
+        let raw = r#"{
+          "schema_version":2,
+          "platform":"wsl2",
+          "captured_at":"2026-08-23T12:00:00Z",
+          "distro":"Example-WSL",
+          "vhdx_path":"X:\\WSL\\Example-WSL\\ext4.vhdx",
+          "vhdx_sparse":false,
+          "volume_root":"X:\\",
+          "volume_total_bytes":1000,
+          "volume_free_bytes":500
+        }"#;
+        assert!(parse_snapshot(raw.as_bytes()).is_err());
+    }
+
+    #[test]
     fn freshness_tolerates_small_windows_wsl_clock_skew() {
         let mut snapshot = HostSnapshot {
             schema_version: 2,
             platform: HostPlatform::Wsl2,
-            captured_at: Utc::now() + chrono::Duration::seconds(2),
+            captured_at: Timestamp::now() + jiff::SignedDuration::from_secs(2),
+            source: None,
             distro: Some("Example-WSL".to_owned()),
             vhdx_path: Some(r"X:\WSL\Example-WSL\ext4.vhdx".to_owned()),
             vhdx_sparse: Some(false),
+            vhdx_size_bytes: Some(120 * GIB),
             volume_root: r"X:\".to_owned(),
             volume_total_bytes: 200 * GIB,
             volume_free_bytes: 80 * GIB,
         };
         snapshot.require_fresh(Duration::from_secs(10)).unwrap();
-        snapshot.captured_at = Utc::now() + chrono::Duration::seconds(10);
+        snapshot.captured_at = Timestamp::now() + jiff::SignedDuration::from_secs(10);
         assert!(snapshot.require_fresh(Duration::from_secs(10)).is_err());
+    }
+
+    fn wsl_snapshot(sparse: bool, vhdx_size_bytes: u64, total: u64, free: u64) -> HostSnapshot {
+        HostSnapshot {
+            schema_version: 2,
+            platform: HostPlatform::Wsl2,
+            captured_at: Timestamp::now(),
+            source: None,
+            distro: Some("Example-WSL".to_owned()),
+            vhdx_path: Some(r"X:\WSL\Example-WSL\ext4.vhdx".to_owned()),
+            vhdx_sparse: Some(sparse),
+            vhdx_size_bytes: Some(vhdx_size_bytes),
+            volume_root: r"X:\".to_owned(),
+            volume_total_bytes: total,
+            volume_free_bytes: free,
+        }
+    }
+
+    #[test]
+    fn non_sparse_vhdx_reports_no_host_reclaim() {
+        let dense = wsl_snapshot(false, 180 * GIB, 200 * GIB, 10 * GIB);
+        assert!(!host_reclaim_possible(&dense));
+        let sparse = wsl_snapshot(true, 180 * GIB, 200 * GIB, 10 * GIB);
+        assert!(host_reclaim_possible(&sparse));
+        let linux = HostSnapshot {
+            schema_version: 2,
+            platform: HostPlatform::Linux,
+            captured_at: Timestamp::now(),
+            source: None,
+            distro: None,
+            vhdx_path: None,
+            vhdx_sparse: None,
+            vhdx_size_bytes: None,
+            volume_root: "/home".to_owned(),
+            volume_total_bytes: 200 * GIB,
+            volume_free_bytes: 80 * GIB,
+        };
+        assert!(host_reclaim_possible(&linux));
+    }
+
+    #[test]
+    fn vhdx_occupancy_uses_physical_file_over_volume() {
+        let snapshot = wsl_snapshot(false, 150 * GIB, 200 * GIB, 50 * GIB);
+        let ratio = vhdx_occupancy_ratio(&snapshot).unwrap();
+        assert!((ratio - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compaction_is_advised_only_when_host_space_cannot_return() {
+        let dense = wsl_snapshot(false, 180 * GIB, 200 * GIB, 10 * GIB);
+        // Under pressure on a non-sparse VHDX.
+        assert!(compaction_advised(
+            Some(&dense),
+            Some(DiskPressure::Pressure),
+            0,
+            Some(0)
+        ));
+        // Logical cleanup removed bytes and the host did not move.
+        assert!(compaction_advised(
+            Some(&dense),
+            Some(DiskPressure::Healthy),
+            100,
+            Some(0)
+        ));
+        // High occupancy alone is enough.
+        assert!(compaction_advised(
+            Some(&dense),
+            Some(DiskPressure::Healthy),
+            0,
+            Some(5 * GIB as i64)
+        ));
+        // Healthy, low occupancy, no futile cleanup.
+        let roomy = wsl_snapshot(false, 40 * GIB, 200 * GIB, 150 * GIB);
+        assert!(!compaction_advised(
+            Some(&roomy),
+            Some(DiskPressure::Healthy),
+            0,
+            Some(1)
+        ));
+        // Sparse VHDX can reclaim; never advise compaction.
+        let sparse = wsl_snapshot(true, 180 * GIB, 200 * GIB, 10 * GIB);
+        assert!(!compaction_advised(
+            Some(&sparse),
+            Some(DiskPressure::Emergency),
+            0,
+            Some(0)
+        ));
+        // No snapshot, no advice.
+        assert!(!compaction_advised(
+            None,
+            Some(DiskPressure::Emergency),
+            0,
+            Some(0)
+        ));
     }
 
     #[test]
@@ -568,6 +901,21 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), MAX_PROBE_OUTPUT_BYTES);
         assert_eq!(output.stderr.len(), MAX_PROBE_OUTPUT_BYTES);
+        assert!(output.stdout_truncated);
+        assert!(output.stderr_truncated);
+    }
+
+    #[test]
+    fn bounded_runner_does_not_wait_for_descendant_holding_pipes() {
+        let started = Instant::now();
+        let result = run_bounded(
+            "/bin/sh",
+            ["-c", "sleep 2 &"],
+            Duration::from_millis(100),
+            &[],
+        );
+        assert!(result.is_err(), "an open descendant pipe must time out");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

@@ -9,26 +9,30 @@ use crate::history::{AuditLog, AuditOutcome, AuditRecord};
 use crate::host::DiskPressure;
 use crate::repository::{Repository, discover_repositories};
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use walkdir::{DirEntry, WalkDir};
 
 const MAX_TREE_ENTRIES: usize = 2_000_000;
 const MAX_DISCOVERED_PROJECTS: usize = 512;
+const MAX_PROC_INSPECTION_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CACHED_PROCESS_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PLANNING_CANDIDATES: usize = 10_000;
+pub const PROCESS_INSPECTION_ERROR_PREFIX: &str = "cannot inspect same-user process ";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupKind {
     JavaScriptCache,
@@ -93,7 +97,7 @@ pub struct CleanupCandidate {
     pub repository: Option<PathBuf>,
     pub minimum_age_hours: u64,
     pub estimated_bytes: u64,
-    pub newest_modified_at: DateTime<Utc>,
+    pub newest_modified_at: Timestamp,
     pub device: u64,
     pub inode: u64,
 }
@@ -106,10 +110,81 @@ pub struct CleanupSkip {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleanupPlan {
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub pressure: DiskPressure,
     pub candidates: Vec<CleanupCandidate>,
     pub skips: Vec<CleanupSkip>,
+}
+
+#[derive(Default)]
+struct PlanningState {
+    processes: PrivilegedProcessCache,
+    seen: HashSet<(PathBuf, CleanupKind, Option<PathBuf>, u64)>,
+    limit_reported: bool,
+}
+
+struct PrivilegedProcessCache {
+    entries: HashMap<PathBuf, PrivilegedProcessSnapshot>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl Default for PrivilegedProcessCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes: 0,
+            max_bytes: MAX_CACHED_PROCESS_BYTES,
+        }
+    }
+}
+
+struct PrivilegedProcessSnapshot {
+    start_time: String,
+    links: Vec<u8>,
+    maps: Vec<u8>,
+    command_line: Vec<u8>,
+}
+
+impl PrivilegedProcessSnapshot {
+    fn bytes(&self) -> usize {
+        self.links.len() + self.maps.len() + self.command_line.len()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PrivilegedProcessCache {
+    fn references_or_collect<F>(
+        &mut self,
+        process: &Path,
+        start_time: &str,
+        candidate: &Path,
+        repository: Option<&Path>,
+        kind: CleanupKind,
+        collect: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce() -> Result<PrivilegedProcessSnapshot>,
+    {
+        if let Some(snapshot) = self.entries.get(process)
+            && snapshot.start_time == start_time
+        {
+            return snapshot_references(snapshot, candidate, repository, kind);
+        }
+        if let Some(previous) = self.entries.remove(process) {
+            self.bytes = self.bytes.saturating_sub(previous.bytes());
+        }
+        let snapshot = collect()?;
+        if snapshot.start_time != start_time {
+            bail!("process identity changed during inspection")
+        }
+        let referenced = snapshot_references(&snapshot, candidate, repository, kind)?;
+        if self.bytes.saturating_add(snapshot.bytes()) <= self.max_bytes {
+            self.bytes += snapshot.bytes();
+            self.entries.insert(process.to_path_buf(), snapshot);
+        }
+        Ok(referenced)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +192,15 @@ pub struct CleanupPlan {
 pub enum CleanupMode {
     DryRun,
     Execute,
+}
+
+/// Explicit manual cache retention policy; automatic maintenance keeps retention.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheAgePolicy {
+    #[default]
+    Retention,
+    IncludeRecent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,8 +223,8 @@ pub struct CleanupAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleanupReport {
-    pub started_at: DateTime<Utc>,
-    pub finished_at: DateTime<Utc>,
+    pub started_at: Timestamp,
+    pub finished_at: Timestamp,
     pub mode: CleanupMode,
     pub pressure: DiskPressure,
     pub planned_logical_bytes: u64,
@@ -155,6 +239,17 @@ impl CleanupReport {
     pub fn succeeded(&self) -> bool {
         self.failures == 0
     }
+
+    #[must_use]
+    pub fn process_inspection_blocked(&self) -> bool {
+        self.planning_skips
+            .iter()
+            .any(|skip| skip.reason.starts_with(PROCESS_INSPECTION_ERROR_PREFIX))
+            || self
+                .actions
+                .iter()
+                .any(|action| action.detail.starts_with(PROCESS_INSPECTION_ERROR_PREFIX))
+    }
 }
 
 pub fn plan_cleanup(
@@ -162,8 +257,17 @@ pub fn plan_cleanup(
     pressure: DiskPressure,
     need_space: bool,
 ) -> Result<CleanupPlan> {
+    plan_cleanup_with_cache_policy(config, pressure, need_space, CacheAgePolicy::Retention)
+}
+
+pub fn plan_cleanup_with_cache_policy(
+    config: &GuardConfig,
+    pressure: DiskPressure,
+    need_space: bool,
+    cache_policy: CacheAgePolicy,
+) -> Result<CleanupPlan> {
     let mut plan = CleanupPlan {
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         pressure,
         candidates: Vec::new(),
         skips: Vec::new(),
@@ -173,7 +277,8 @@ pub fn plan_cleanup(
     }
 
     let compress_ages = need_space || pressure != DiskPressure::Healthy;
-    add_global_caches(config, compress_ages, &mut plan);
+    let mut state = PlanningState::default();
+    add_global_caches(config, compress_ages, cache_policy, &mut plan, &mut state);
     let discovery = discover_repositories(&config.cleanup.scan_roots)?;
     plan.skips
         .extend(discovery.skipped.into_iter().map(|skip| CleanupSkip {
@@ -188,7 +293,14 @@ pub fn plan_cleanup(
             });
             continue;
         }
-        add_repository_candidates(config, compress_ages, &repository, &mut plan);
+        add_repository_candidates(
+            config,
+            compress_ages,
+            cache_policy,
+            &repository,
+            &mut plan,
+            &mut state,
+        );
     }
 
     plan.candidates.sort_by(|left, right| {
@@ -204,13 +316,41 @@ pub fn plan_cleanup(
     Ok(plan)
 }
 
+/// Action ceiling for one cleanup cycle.
+///
+/// `Emergency` raises the ceiling so regenerable artifacts are cleared before
+/// anything outside GuardWSL's scope (like an offline VHDX compact) is needed.
+/// Risk order still applies: caches first, then build outputs, then
+/// `node_modules`.
+#[must_use]
+pub fn effective_max_actions(pressure: DiskPressure, configured: usize) -> usize {
+    if pressure == DiskPressure::Emergency {
+        configured.max(40)
+    } else {
+        configured
+    }
+}
+
 pub fn execute_cleanup(
     config: &GuardConfig,
     plan: &CleanupPlan,
     mode: CleanupMode,
     audit: &AuditLog,
 ) -> Result<CleanupReport> {
-    let started_at = Utc::now();
+    execute_cleanup_with_hook(config, plan, mode, audit, |_| {})
+}
+
+fn execute_cleanup_with_hook<F>(
+    config: &GuardConfig,
+    plan: &CleanupPlan,
+    mode: CleanupMode,
+    audit: &AuditLog,
+    mut before_final_process_check: F,
+) -> Result<CleanupReport>
+where
+    F: FnMut(&CleanupCandidate),
+{
+    let started_at = Timestamp::now();
     let mut report = CleanupReport {
         started_at,
         finished_at: started_at,
@@ -227,19 +367,17 @@ pub fn execute_cleanup(
         failures: 0,
     };
 
-    for planned in plan
-        .candidates
-        .iter()
-        .take(config.cleanup.max_actions_per_cycle)
-    {
+    let max_actions = effective_max_actions(plan.pressure, config.cleanup.max_actions_per_cycle);
+    for planned in plan.candidates.iter().take(max_actions) {
         if mode == CleanupMode::DryRun {
             audit.append(
                 &AuditRecord::new(
                     "cleanup",
                     AuditOutcome::Planned,
                     format!(
-                        "dry run: logical {} removal; no mutation performed",
-                        planned.kind.as_str()
+                        "dry run: logical {} removal; minimum_age_hours={}; no mutation performed",
+                        planned.kind.as_str(),
+                        planned.minimum_age_hours
                     ),
                 )
                 .for_path(&planned.path)
@@ -307,11 +445,40 @@ pub fn execute_cleanup(
             &AuditRecord::new(
                 "cleanup",
                 AuditOutcome::Planned,
-                format!("logical {} removal", current.kind.as_str()),
+                format!(
+                    "logical {} removal; minimum_age_hours={}",
+                    current.kind.as_str(),
+                    current.minimum_age_hours
+                ),
             )
             .for_path(&current.path)
             .with_estimated_bytes(current.estimated_bytes),
         )?;
+
+        before_final_process_check(&current);
+        // Never reuse the planning snapshot for a real removal. A process can
+        // open the candidate while its tree is profiled or the audit is written.
+        let process_check =
+            path_is_in_use(&current.path, current.repository.as_deref(), current.kind);
+        let skip = match process_check {
+            Ok(false) => None,
+            Ok(true) => Some("candidate is in use immediately before removal".to_owned()),
+            Err(error) => Some(format!("{error:#}")),
+        };
+        if let Some(reason) = skip {
+            audit.append(
+                &AuditRecord::new("cleanup", AuditOutcome::Skipped, &reason)
+                    .for_path(&current.path),
+            )?;
+            report.actions.push(CleanupAction {
+                path: current.path,
+                kind: current.kind,
+                outcome: CleanupActionOutcome::Skipped,
+                logical_bytes: 0,
+                detail: reason,
+            });
+            continue;
+        }
 
         match quarantine_and_remove(&current.path, current.device, current.inode) {
             Ok(()) => {
@@ -348,11 +515,17 @@ pub fn execute_cleanup(
             }
         }
     }
-    report.finished_at = Utc::now();
+    report.finished_at = Timestamp::now();
     Ok(report)
 }
 
-fn add_global_caches(config: &GuardConfig, compress_ages: bool, plan: &mut CleanupPlan) {
+fn add_global_caches(
+    config: &GuardConfig,
+    compress_ages: bool,
+    cache_policy: CacheAgePolicy,
+    plan: &mut CleanupPlan,
+    state: &mut PlanningState,
+) {
     let Some(home) = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -363,7 +536,7 @@ fn add_global_caches(config: &GuardConfig, compress_ages: bool, plan: &mut Clean
         });
         return;
     };
-    let age = age_for(config, compress_ages, config.cleanup.cache_min_age_hours);
+    let age = cache_age_for(config, compress_ages, cache_policy);
     for (path, kind) in [
         (home.join(".npm/_cacache"), CleanupKind::JavaScriptCache),
         (home.join(".cache/yarn"), CleanupKind::JavaScriptCache),
@@ -385,17 +558,19 @@ fn add_global_caches(config: &GuardConfig, compress_ages: bool, plan: &mut Clean
         (home.join(".cache/vscode-cpptools"), CleanupKind::ToolCache),
         (home.join(".cache/ms-playwright"), CleanupKind::ToolCache),
     ] {
-        push_candidate(config, path, kind, None, age, plan);
+        push_candidate(config, path, kind, None, age, plan, state);
     }
 }
 
 fn add_repository_candidates(
     config: &GuardConfig,
     compress_ages: bool,
+    cache_policy: CacheAgePolicy,
     repository: &Repository,
     plan: &mut CleanupPlan,
+    state: &mut PlanningState,
 ) {
-    let cache_age = age_for(config, compress_ages, config.cleanup.cache_min_age_hours);
+    let cache_age = cache_age_for(config, compress_ages, cache_policy);
     for name in [
         ".turbo",
         ".vite",
@@ -410,6 +585,7 @@ fn add_repository_candidates(
             Some(&repository.root),
             cache_age,
             plan,
+            state,
         );
     }
 
@@ -423,6 +599,7 @@ fn add_repository_candidates(
                 Some(&repository.root),
                 age_for(config, compress_ages, config.cleanup.build_min_age_hours),
                 plan,
+                state,
             );
         }
         if project.join("package.json").is_file() {
@@ -433,6 +610,7 @@ fn add_repository_candidates(
                 Some(&repository.root),
                 age_for(config, compress_ages, config.cleanup.build_min_age_hours),
                 plan,
+                state,
             );
             if find_lockfile(&project, Some(&repository.root)) {
                 push_candidate(
@@ -446,6 +624,7 @@ fn add_repository_candidates(
                         config.cleanup.node_modules_min_age_hours,
                     ),
                     plan,
+                    state,
                 );
             }
         }
@@ -479,6 +658,9 @@ fn discover_project_roots(repository: &Path) -> Vec<PathBuf> {
 fn project_walk_entry(entry: &DirEntry) -> bool {
     if entry.depth() == 0 {
         return true;
+    }
+    if entry.file_type().is_dir() && !has_no_git_marker(entry.path()) {
+        return false;
     }
     let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
     if name.starts_with(".guardwsl-trash-") {
@@ -551,6 +733,15 @@ fn age_for(config: &GuardConfig, compress_ages: bool, normal: u64) -> u64 {
     }
 }
 
+fn cache_age_for(config: &GuardConfig, compress_ages: bool, policy: CacheAgePolicy) -> u64 {
+    match policy {
+        CacheAgePolicy::Retention => {
+            age_for(config, compress_ages, config.cleanup.cache_min_age_hours)
+        }
+        CacheAgePolicy::IncludeRecent => 0,
+    }
+}
+
 fn push_candidate(
     config: &GuardConfig,
     path: PathBuf,
@@ -558,11 +749,39 @@ fn push_candidate(
     repository: Option<&Path>,
     minimum_age_hours: u64,
     plan: &mut CleanupPlan,
+    state: &mut PlanningState,
 ) {
     if !path.exists() {
         return;
     }
-    match inspect_candidate(config, &path, kind, repository, minimum_age_hours) {
+    let key = (
+        path.clone(),
+        kind,
+        repository.map(Path::to_path_buf),
+        minimum_age_hours,
+    );
+    if state.seen.contains(&key) {
+        return;
+    }
+    if state.seen.len() >= MAX_PLANNING_CANDIDATES {
+        if !state.limit_reported {
+            plan.skips.push(CleanupSkip {
+                path,
+                reason: "candidate planning limit reached; remaining paths preserved".to_owned(),
+            });
+            state.limit_reported = true;
+        }
+        return;
+    }
+    state.seen.insert(key);
+    match inspect_candidate_with_cache(
+        config,
+        &path,
+        kind,
+        repository,
+        minimum_age_hours,
+        &mut state.processes,
+    ) {
         Ok(candidate) => plan.candidates.push(candidate),
         Err(error) => plan.skips.push(CleanupSkip {
             path,
@@ -577,6 +796,24 @@ fn inspect_candidate(
     kind: CleanupKind,
     repository: Option<&Path>,
     minimum_age_hours: u64,
+) -> Result<CleanupCandidate> {
+    inspect_candidate_with_cache(
+        config,
+        path,
+        kind,
+        repository,
+        minimum_age_hours,
+        &mut PrivilegedProcessCache::default(),
+    )
+}
+
+fn inspect_candidate_with_cache(
+    config: &GuardConfig,
+    path: &Path,
+    kind: CleanupKind,
+    repository: Option<&Path>,
+    minimum_age_hours: u64,
+    process_cache: &mut PrivilegedProcessCache,
 ) -> Result<CleanupCandidate> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -611,7 +848,7 @@ fn inspect_candidate(
     if let Some(repository) = repository {
         validate_git_state(repository, &canonical)?;
     }
-    if path_is_in_use(&canonical)? {
+    if path_is_in_use_with_cache(&canonical, repository, kind, process_cache)? {
         bail!("candidate is in use by an active process")
     }
     let profile = profile_tree(&canonical)?;
@@ -631,7 +868,7 @@ fn inspect_candidate(
         repository: repository.map(Path::to_path_buf),
         minimum_age_hours,
         estimated_bytes: profile.bytes,
-        newest_modified_at: DateTime::<Utc>::from(profile.newest_modified),
+        newest_modified_at: Timestamp::try_from(profile.newest_modified)?,
         device: profile.device,
         inode: profile.inode,
     })
@@ -720,10 +957,19 @@ fn regular_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
 }
 
+fn has_no_git_marker(directory: &Path) -> bool {
+    matches!(fs::symlink_metadata(directory.join(".git")), Err(error) if error.kind() == io::ErrorKind::NotFound)
+}
+
 fn validate_git_state(repository: &Path, candidate: &Path) -> Result<()> {
     let relative = candidate
         .strip_prefix(repository)
         .context("candidate escaped the repository")?;
+    for directory in candidate.ancestors().take_while(|path| *path != repository) {
+        if !has_no_git_marker(directory) {
+            bail!("candidate crosses a Git repository boundary")
+        }
+    }
     let relative = relative.to_string_lossy();
     let literal = format!(":(literal){relative}");
     let tracked = git_status(
@@ -744,29 +990,20 @@ fn validate_git_state(repository: &Path, candidate: &Path) -> Result<()> {
 }
 
 fn git_status<const N: usize>(repository: &Path, args: [&str; N]) -> Result<i32> {
-    let mut child = Command::new("git")
-        .arg("-c")
-        .arg("safe.directory=*")
-        .arg("-C")
-        .arg(repository)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("git is unavailable")?;
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status.code().unwrap_or(128));
-        }
-        if started.elapsed() >= Duration::from_secs(3) {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("git exceeded the 3-second timeout")
-        }
-        thread::sleep(Duration::from_millis(25));
+    let mut git_args = vec!["-c".into(), "safe.directory=*".into(), "-C".into()];
+    git_args.push(repository.as_os_str().to_owned());
+    git_args.extend(args.into_iter().map(Into::into));
+    let output = crate::host::run_bounded_cleanup_command(
+        "git",
+        git_args,
+        Duration::from_secs(3),
+        64 * 1024,
+    )
+    .context("git is unavailable or did not complete")?;
+    if output.stdout_truncated || output.stderr_truncated {
+        bail!("git output exceeded limit")
     }
+    Ok(output.status.code().unwrap_or(128))
 }
 
 #[derive(Debug)]
@@ -803,6 +1040,9 @@ fn profile_tree(path: &Path) -> Result<TreeProfile> {
         }
         let entry = entry?;
         let entry_path = entry.path();
+        if entry.file_name() == ".git" {
+            bail!("candidate contains Git data")
+        }
         if mounts.iter().any(|mount| mount == entry_path) {
             bail!(
                 "candidate contains a nested mount at {}",
@@ -878,15 +1118,28 @@ fn unescape_mount_path(value: &str) -> String {
 ///
 /// This boundary is intentional: candidates, their parents, and scan roots are
 /// authenticated as owner-only writable through their immediate parent.
-/// Only the base `systemd --user` and
-/// `(sd-pam)` processes may deny reads without blocking a scan; any other
-/// incompletely inspected same-user process makes the candidate appear in use.
-fn path_is_in_use(candidate: &Path) -> Result<bool> {
-    let proc = fs::read_dir("/proc")?;
+/// An inaccessible process is checked through a bounded, read-only privileged
+/// fallback when available. Uncertainty always preserves the candidate.
+fn path_is_in_use(candidate: &Path, repository: Option<&Path>, kind: CleanupKind) -> Result<bool> {
+    path_is_in_use_with_cache(
+        candidate,
+        repository,
+        kind,
+        &mut PrivilegedProcessCache::default(),
+    )
+}
+
+fn path_is_in_use_with_cache(
+    candidate: &Path,
+    repository: Option<&Path>,
+    kind: CleanupKind,
+    process_cache: &mut PrivilegedProcessCache,
+) -> Result<bool> {
+    let proc = fs::read_dir("/proc").context("cannot inspect same-user process list")?;
     let current_uid = effective_uid();
     let current_pid = std::process::id().to_string();
     for process in proc {
-        let process = process?;
+        let process = process.context("cannot inspect same-user process list")?;
         let pid_str = process.file_name();
         let pid_bytes = pid_str.to_string_lossy();
         if !pid_bytes.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -896,7 +1149,9 @@ fn path_is_in_use(candidate: &Path) -> Result<bool> {
         let metadata = match process.metadata() {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                bail!("{PROCESS_INSPECTION_ERROR_PREFIX}{}: {error}", pid_bytes)
+            }
         };
         #[cfg(target_os = "linux")]
         if metadata.uid() != current_uid {
@@ -906,12 +1161,22 @@ fn path_is_in_use(candidate: &Path) -> Result<bool> {
         for link in ["cwd", "root", "exe"] {
             match fs::read_link(process.path().join(link)) {
                 Ok(path) if reference_hits(&path, candidate) => return Ok(true),
+                Ok(path)
+                    if !is_self
+                        && link == "cwd"
+                        && repository.is_some_and(|root| reference_hits(&path, root)) =>
+                {
+                    return Ok(true);
+                }
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied && !is_self => {
                     inspection_denied = true;
                 }
-                Err(_) => {}
+                Err(_) if !is_self => inspection_denied = true,
+                Err(error) => {
+                    bail!("{PROCESS_INSPECTION_ERROR_PREFIX}{}: {error}", pid_bytes)
+                }
             }
         }
         let fd_dir = process.path().join("fd");
@@ -933,7 +1198,10 @@ fn path_is_in_use(candidate: &Path) -> Result<bool> {
                         {
                             inspection_denied = true;
                         }
-                        Err(_) => {}
+                        Err(_) if !is_self => inspection_denied = true,
+                        Err(error) => {
+                            bail!("{PROCESS_INSPECTION_ERROR_PREFIX}{}: {error}", pid_bytes)
+                        }
                     }
                 }
             }
@@ -941,50 +1209,386 @@ fn path_is_in_use(candidate: &Path) -> Result<bool> {
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied && !is_self => {
                 inspection_denied = true;
             }
-            Err(_) => {}
-        }
-        let command_line = fs::read(process.path().join("cmdline")).unwrap_or_default();
-        for argument in command_line.split(|byte| *byte == 0) {
-            let argument = String::from_utf8_lossy(argument);
-            let value = argument
-                .split_once('=')
-                .map_or(argument.as_ref(), |(_, value)| value);
-            if value.starts_with('/') && reference_hits(Path::new(value), candidate) {
-                return Ok(true);
+            Err(_) if !is_self => inspection_denied = true,
+            Err(error) => {
+                bail!("{PROCESS_INSPECTION_ERROR_PREFIX}{}: {error}", pid_bytes)
             }
         }
-        if inspection_denied && !command_line.is_empty() && !is_inert_user_manager(&command_line) {
+        match read_proc_file_limited(&process.path().join("maps")) {
+            Ok(maps) => {
+                if mapped_path_hits(&maps, candidate)
+                    .with_context(|| format!("{PROCESS_INSPECTION_ERROR_PREFIX}{}", pid_bytes))?
+                {
+                    return Ok(true);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied && !is_self => {
+                inspection_denied = true;
+            }
+            Err(error) => {
+                bail!("{PROCESS_INSPECTION_ERROR_PREFIX}{}: {error}", pid_bytes)
+            }
+        }
+        let command_line = match fs::read(process.path().join("cmdline")) {
+            Ok(command_line) => command_line,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied && !is_self => {
+                inspection_denied = true;
+                Vec::new()
+            }
+            Err(error) => {
+                bail!("{PROCESS_INSPECTION_ERROR_PREFIX}{}: {error}", pid_bytes)
+            }
+        };
+        if command_line_hits(&command_line, candidate) {
             return Ok(true);
+        }
+        if !is_self && repository.is_some_and(|root| command_line_hits(&command_line, root)) {
+            return Ok(true);
+        }
+        if !is_self
+            && active_tool_may_use_cache(kind, &command_line)
+            && !go_uses_separate_build_cache(&process.path(), candidate, kind)
+        {
+            return Ok(true);
+        }
+        if inspection_denied {
+            if command_line.is_empty() && process_is_zombie(&process.path()) {
+                continue;
+            }
+            match privileged_process_references(
+                &process.path(),
+                current_uid,
+                candidate,
+                repository,
+                kind,
+                process_cache,
+            ) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(error) => {
+                    bail!("{PROCESS_INSPECTION_ERROR_PREFIX}{}: {error:#}", pid_bytes)
+                }
+            }
         }
     }
     Ok(false)
 }
 
-fn is_inert_user_manager(command_line: &[u8]) -> bool {
-    let arguments = command_line
-        .split(|byte| *byte == 0)
-        .filter(|argument| !argument.is_empty())
-        .collect::<Vec<_>>();
-    if matches!(
-        arguments.as_slice(),
-        [program, flag]
-            if (*program == b"/usr/lib/systemd/systemd" || *program == b"/lib/systemd/systemd")
-                && *flag == b"--user"
-    ) || matches!(arguments.as_slice(), [program] if *program == b"(sd-pam)")
-    {
-        return true;
+#[cfg(target_os = "linux")]
+fn command_line_hits(command_line: &[u8], candidate: &Path) -> bool {
+    command_line.split(|byte| *byte == 0).any(|argument| {
+        let value = argument
+            .iter()
+            .position(|byte| *byte == b'=')
+            .map_or(argument, |index| &argument[index + 1..]);
+        value.starts_with(b"/")
+            && reference_hits(Path::new(std::ffi::OsStr::from_bytes(value)), candidate)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn command_line_hits(_command_line: &[u8], _candidate: &Path) -> bool {
+    false
+}
+
+fn active_tool_may_use_cache(kind: CleanupKind, command_line: &[u8]) -> bool {
+    let names: &[&[u8]] = match kind {
+        CleanupKind::GoCache => &[b"go", b"gopls"],
+        CleanupKind::RustCache => &[b"cargo"],
+        CleanupKind::JavaScriptCache => &[
+            b"npm",
+            b"npx",
+            b"pnpm",
+            b"yarn",
+            b"bun",
+            b"npm-cli.js",
+            b"npx-cli.js",
+            b"pnpm.cjs",
+            b"yarn.js",
+        ],
+        CleanupKind::ToolCache => &[b"sccache"],
+        _ => return false,
+    };
+    command_line.split(|byte| *byte == 0).any(|argument| {
+        let name = argument
+            .rsplit(|byte| *byte == b'/')
+            .next()
+            .unwrap_or_default();
+        names.contains(&name)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn go_uses_separate_build_cache(process: &Path, candidate: &Path, kind: CleanupKind) -> bool {
+    if kind != CleanupKind::GoCache || !candidate.ends_with(".cache/go-build") {
+        return false;
     }
-    if let Some(program) = arguments.first() {
-        let program_str = String::from_utf8_lossy(program);
-        if program_str.ends_with("/Runner.Listener")
-            || program_str.ends_with("/Runner.Worker")
-            || program_str == "Runner.Listener"
-            || program_str == "Runner.Worker"
-        {
-            return true;
+    if fs::read_link(process.join("exe"))
+        .ok()
+        .as_deref()
+        .and_then(Path::file_name)
+        != Some(std::ffi::OsStr::new("go"))
+    {
+        return false;
+    }
+    // Only interpret absolute paths when the process sees the same mounts and root.
+    for part in ["ns/mnt", "root"] {
+        let (Ok(theirs), Ok(ours)) = (
+            fs::metadata(process.join(part)),
+            fs::metadata(Path::new("/proc/self").join(part)),
+        ) else {
+            return false;
+        };
+        if (theirs.dev(), theirs.ino()) != (ours.dev(), ours.ino()) {
+            return false;
         }
     }
+    // An unreadable environment or an external cache program leaves the default protected.
+    let Ok(env) = fs::read(process.join("environ")) else {
+        return false;
+    };
+    let mut entries = env.split(|b| *b == 0);
+    if entries.clone().any(|entry| {
+        entry
+            .strip_prefix(b"GOCACHEPROG=")
+            .is_some_and(|v| !v.is_empty())
+    }) {
+        return false;
+    }
+    let Some(raw) = entries.find_map(|entry| entry.strip_prefix(b"GOCACHE=")) else {
+        return false;
+    };
+    let configured = Path::new(std::ffi::OsStr::from_bytes(raw));
+    if !configured.is_absolute() {
+        return false;
+    }
+    let Ok(resolved) = configured.canonicalize() else {
+        return false;
+    };
+    if !resolved.is_dir() || candidate.starts_with(&resolved) || resolved.starts_with(candidate) {
+        return false;
+    }
+    // A different mount on the same device may bind a subtree of the default.
+    let Ok(mounts) = mount_points() else {
+        return false;
+    };
+    let containing_mount = |path: &Path| {
+        mounts
+            .iter()
+            .filter(|mount| path.starts_with(mount))
+            .max_by_key(|mount| mount.components().count())
+    };
+    let Some(default_mount) = containing_mount(candidate) else {
+        return false;
+    };
+    containing_mount(&resolved) == Some(default_mount)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn go_uses_separate_build_cache(_process: &Path, _candidate: &Path, _kind: CleanupKind) -> bool {
     false
+}
+
+fn process_is_zombie(process: &Path) -> bool {
+    fs::read_to_string(process.join("stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .map(|(_, fields)| fields.trim_start().starts_with('Z'))
+        })
+        .unwrap_or(false)
+}
+
+fn read_proc_file_limited(path: &Path) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_PROC_INSPECTION_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PROC_INSPECTION_BYTES {
+        return Err(io::Error::other("process inspection output exceeded limit"));
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn mapped_path_hits(maps: &[u8], candidate: &Path) -> Result<bool> {
+    for line in maps
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let mut index = 0;
+        for _ in 0..5 {
+            while index < line.len() && line[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            let start = index;
+            while index < line.len() && !line[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if start == index {
+                bail!("invalid process maps entry")
+            }
+        }
+        while index < line.len() && line[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let path = &line[index..];
+        if path.starts_with(b"/") {
+            let path = path.strip_suffix(b" (deleted)").unwrap_or(path);
+            if reference_hits(Path::new(std::ffi::OsStr::from_bytes(path)), candidate) {
+                return Ok(true);
+            }
+            if path.windows(4).any(|window| window == b"\\012") {
+                let decoded = path.split(|byte| *byte == b'\\').enumerate().fold(
+                    Vec::new(),
+                    |mut output, (index, part)| {
+                        if index == 0 {
+                            output.extend_from_slice(part);
+                        } else if let Some(rest) = part.strip_prefix(b"012") {
+                            output.push(b'\n');
+                            output.extend_from_slice(rest);
+                        } else {
+                            output.push(b'\\');
+                            output.extend_from_slice(part);
+                        }
+                        output
+                    },
+                );
+                if reference_hits(Path::new(std::ffi::OsStr::from_bytes(&decoded)), candidate) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mapped_path_hits(_maps: &[u8], _candidate: &Path) -> Result<bool> {
+    bail!("process map inspection is only available on Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time(process: &Path, expected_uid: u32) -> Result<String> {
+    if fs::metadata(process)?.uid() != expected_uid {
+        bail!("process owner changed")
+    }
+    let stat = fs::read_to_string(process.join("stat"))?;
+    let fields = stat.rsplit_once(')').context("invalid process stat")?.1;
+    Ok(fields
+        .split_ascii_whitespace()
+        .nth(19)
+        .context("missing process start time")?
+        .to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn privileged_process_references(
+    process: &Path,
+    uid: u32,
+    candidate: &Path,
+    repository: Option<&Path>,
+    kind: CleanupKind,
+    cache: &mut PrivilegedProcessCache,
+) -> Result<bool> {
+    let before = process_start_time(process, uid)?;
+    cache.references_or_collect(process, &before, candidate, repository, kind, || {
+        let links = run_readonly_proc_command(
+            "/usr/bin/find",
+            &[
+                process.join("cwd").into_os_string(),
+                process.join("root").into_os_string(),
+                process.join("exe").into_os_string(),
+                process.join("fd").into_os_string(),
+                "-maxdepth".into(),
+                "1".into(),
+                "-type".into(),
+                "l".into(),
+                "-printf".into(),
+                "%l\\0".into(),
+            ],
+        )?;
+        let maps =
+            run_readonly_proc_command("/usr/bin/cat", &[process.join("maps").into_os_string()])?;
+        let command_line =
+            run_readonly_proc_command("/usr/bin/cat", &[process.join("cmdline").into_os_string()])?;
+        if before != process_start_time(process, uid)? {
+            bail!("process identity changed during inspection")
+        }
+        Ok(PrivilegedProcessSnapshot {
+            start_time: before.clone(),
+            links,
+            maps,
+            command_line,
+        })
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_references(
+    snapshot: &PrivilegedProcessSnapshot,
+    candidate: &Path,
+    repository: Option<&Path>,
+    kind: CleanupKind,
+) -> Result<bool> {
+    for link in snapshot
+        .links
+        .split(|byte| *byte == 0)
+        .filter(|link| !link.is_empty())
+    {
+        let path = Path::new(std::ffi::OsStr::from_bytes(link));
+        if reference_hits(path, candidate)
+            || repository.is_some_and(|root| reference_hits(path, root))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(command_line_hits(&snapshot.command_line, candidate)
+        || mapped_path_hits(&snapshot.maps, candidate)?
+        || active_tool_may_use_cache(kind, &snapshot.command_line)
+        || repository.is_some_and(|root| command_line_hits(&snapshot.command_line, root))
+        || if let Some(root) = repository {
+            mapped_path_hits(&snapshot.maps, root)?
+        } else {
+            false
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn privileged_process_references(
+    _process: &Path,
+    _uid: u32,
+    _candidate: &Path,
+    _repository: Option<&Path>,
+    _kind: CleanupKind,
+    _cache: &mut PrivilegedProcessCache,
+) -> Result<bool> {
+    bail!("privileged process inspection is only available on Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn run_readonly_proc_command(program: &str, arguments: &[std::ffi::OsString]) -> Result<Vec<u8>> {
+    let mut args: Vec<std::ffi::OsString> = ["5s", "/usr/bin/sudo", "-n", program]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    args.extend_from_slice(arguments);
+    let output = crate::host::run_bounded_cleanup_command(
+        "/usr/bin/timeout",
+        args,
+        Duration::from_secs(6),
+        MAX_PROC_INSPECTION_BYTES as usize,
+    )
+    .context("read-only process inspection unavailable")?;
+    if output.stdout_truncated || output.stderr_truncated {
+        bail!("process inspection output exceeded limit")
+    }
+    if !output.status.success() {
+        bail!("read-only process inspection failed; non-interactive sudo may be unavailable")
+    }
+    Ok(output.stdout)
 }
 
 fn reference_hits(reference: &Path, candidate: &Path) -> bool {
@@ -1100,6 +1704,428 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use tempfile::tempdir;
 
+    fn fresh_cache_fixture() -> (tempfile::TempDir, GuardConfig, Repository) {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(
+            root.join(".gitignore"),
+            b"/.turbo\n/target\n/.next\n/node_modules\n",
+        )
+        .unwrap();
+        fs::write(root.join("Cargo.toml"), b"[workspace]\n").unwrap();
+        fs::write(root.join("package.json"), b"{}").unwrap();
+        fs::write(root.join("yarn.lock"), b"# fixture\n").unwrap();
+        for name in [".turbo", "target", ".next", "node_modules", "dist"] {
+            fs::create_dir(root.join(name)).unwrap();
+            fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(root.join(name).join("artifact"), b"regenerable").unwrap();
+        }
+        let mut config = GuardConfig::default();
+        config.cleanup.protected_paths.clear();
+        config.cleanup.scan_roots = vec![root.clone()];
+        (directory, config, Repository { root })
+    }
+
+    // Build only a temporary repository plan: never execute HOME discovery in a test.
+    fn fresh_cache_plan(
+        config: &GuardConfig,
+        repository: &Repository,
+        policy: CacheAgePolicy,
+    ) -> CleanupPlan {
+        let mut plan = CleanupPlan {
+            created_at: Timestamp::now(),
+            pressure: DiskPressure::Healthy,
+            candidates: vec![],
+            skips: vec![],
+        };
+        add_repository_candidates(
+            config,
+            false,
+            policy,
+            repository,
+            &mut plan,
+            &mut PlanningState::default(),
+        );
+        plan
+    }
+
+    #[test]
+    fn manual_recent_cache_cleanup_is_scoped_audited_and_idempotent() {
+        let (directory, config, repository) = fresh_cache_fixture();
+        for _ in 0..2 {
+            let retained = fresh_cache_plan(&config, &repository, CacheAgePolicy::Retention);
+            assert!(retained.candidates.is_empty());
+            assert!(repository.root.join(".turbo/artifact").exists());
+        }
+        let plan = fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent);
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].kind, CleanupKind::ProjectCache);
+        assert_eq!(plan.candidates[0].minimum_age_hours, 0);
+        let audit = AuditLog::at(directory.path().join("audit.jsonl"));
+        let dry_run = execute_cleanup(&config, &plan, CleanupMode::DryRun, &audit).unwrap();
+        assert_eq!(dry_run.deleted_logical_bytes, 0);
+        assert!(repository.root.join(".turbo/artifact").exists());
+        let executed = execute_cleanup(&config, &plan, CleanupMode::Execute, &audit).unwrap();
+        assert_eq!(executed.failures, 0);
+        assert!(executed.deleted_logical_bytes > 0);
+        assert!(!repository.root.join(".turbo").exists());
+        for name in ["target", ".next", "node_modules", "dist"] {
+            assert!(repository.root.join(name).join("artifact").exists());
+        }
+        let records = audit.tail(10).unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.outcome == AuditOutcome::Planned
+                    && record.detail.contains("minimum_age_hours=0"))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.outcome == AuditOutcome::Success)
+        );
+        let retried = fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent);
+        assert!(retried.candidates.is_empty());
+        assert_eq!(
+            execute_cleanup(&config, &retried, CleanupMode::Execute, &audit)
+                .unwrap()
+                .deleted_logical_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn manual_recent_cache_cleanup_preserves_protected_and_open_files() {
+        let (_directory, mut config, repository) = fresh_cache_fixture();
+        let artifact = repository.root.join(".turbo/artifact");
+        config.cleanup.protected_paths.push(artifact.clone());
+        assert!(
+            fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent)
+                .candidates
+                .is_empty()
+        );
+        config.cleanup.protected_paths.clear();
+        let held_open = fs::File::open(&artifact).unwrap();
+        let blocked = fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent);
+        assert!(blocked.candidates.is_empty());
+        assert!(
+            blocked
+                .skips
+                .iter()
+                .any(|skip| skip.reason.contains("active process"))
+        );
+        drop(held_open);
+        assert_eq!(
+            fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent)
+                .candidates
+                .len(),
+            1
+        );
+        assert_eq!(fs::read(&artifact).unwrap(), b"regenerable");
+    }
+
+    #[test]
+    fn process_opened_after_planning_is_preserved_on_execution() {
+        let (directory, config, repository) = fresh_cache_fixture();
+        let plan = fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent);
+        assert_eq!(plan.candidates.len(), 1);
+        let artifact = repository.root.join(".turbo/artifact");
+        let held_open = fs::File::open(&artifact).unwrap();
+        let audit = AuditLog::at(directory.path().join("audit.jsonl"));
+        let report = execute_cleanup(&config, &plan, CleanupMode::Execute, &audit).unwrap();
+        assert_eq!(report.deleted_logical_bytes, 0);
+        assert!(artifact.exists());
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|action| action.outcome == CleanupActionOutcome::Skipped)
+        );
+        drop(held_open);
+    }
+
+    #[test]
+    fn process_opened_after_audit_is_preserved_before_quarantine() {
+        let (directory, config, repository) = fresh_cache_fixture();
+        let plan = fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent);
+        assert_eq!(plan.candidates.len(), 1);
+        let audit = AuditLog::at(directory.path().join("audit.jsonl"));
+        let mut held_open = None;
+        let report =
+            execute_cleanup_with_hook(&config, &plan, CleanupMode::Execute, &audit, |candidate| {
+                held_open = Some(fs::File::open(candidate.path.join("artifact")).unwrap());
+            })
+            .unwrap();
+        assert!(repository.root.join(".turbo/artifact").exists());
+        assert_eq!(report.deleted_logical_bytes, 0);
+        assert!(report.actions.iter().any(|action| {
+            action.outcome == CleanupActionOutcome::Skipped
+                && action.detail.contains("immediately before removal")
+        }));
+        assert!(held_open.is_some());
+    }
+
+    #[test]
+    fn planning_deduplicates_identical_candidate_contexts() {
+        let (_directory, config, repository) = fresh_cache_fixture();
+        let mut plan = CleanupPlan {
+            created_at: Timestamp::now(),
+            pressure: DiskPressure::Healthy,
+            candidates: Vec::new(),
+            skips: Vec::new(),
+        };
+        let mut state = PlanningState::default();
+        for _ in 0..2 {
+            push_candidate(
+                &config,
+                repository.root.join(".turbo"),
+                CleanupKind::ProjectCache,
+                Some(&repository.root),
+                0,
+                &mut plan,
+                &mut state,
+            );
+        }
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(state.seen.len(), 1);
+    }
+
+    #[test]
+    fn planning_limit_preserves_remaining_candidates_and_reports_once() {
+        let (_directory, config, repository) = fresh_cache_fixture();
+        let mut plan = CleanupPlan {
+            created_at: Timestamp::now(),
+            pressure: DiskPressure::Healthy,
+            candidates: Vec::new(),
+            skips: Vec::new(),
+        };
+        let mut state = PlanningState::default();
+        for number in 0..MAX_PLANNING_CANDIDATES {
+            state.seen.insert((
+                PathBuf::from(format!("/synthetic/{number}")),
+                CleanupKind::ProjectCache,
+                None,
+                0,
+            ));
+        }
+        for _ in 0..2 {
+            push_candidate(
+                &config,
+                repository.root.join(".turbo"),
+                CleanupKind::ProjectCache,
+                Some(&repository.root),
+                0,
+                &mut plan,
+                &mut state,
+            );
+        }
+        assert!(plan.candidates.is_empty());
+        assert_eq!(plan.skips.len(), 1);
+        assert!(plan.skips[0].reason.contains("planning limit"));
+        assert!(repository.root.join(".turbo/artifact").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_snapshot_is_reused_only_for_the_same_process_identity() {
+        use std::cell::Cell;
+
+        let mut cache = PrivilegedProcessCache::default();
+        let calls = Cell::new(0);
+        let process = Path::new("/proc/123");
+        let collect = |start: &str| {
+            calls.set(calls.get() + 1);
+            Ok(PrivilegedProcessSnapshot {
+                start_time: start.to_owned(),
+                links: b"/tmp/first/cache/file\0".to_vec(),
+                maps: Vec::new(),
+                command_line: b"daemon\0".to_vec(),
+            })
+        };
+        assert!(
+            cache
+                .references_or_collect(
+                    process,
+                    "11",
+                    Path::new("/tmp/first/cache"),
+                    None,
+                    CleanupKind::ProjectCache,
+                    || collect("11")
+                )
+                .unwrap()
+        );
+        assert!(
+            !cache
+                .references_or_collect(
+                    process,
+                    "11",
+                    Path::new("/tmp/other/cache"),
+                    None,
+                    CleanupKind::ProjectCache,
+                    || collect("11")
+                )
+                .unwrap()
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(
+            cache
+                .references_or_collect(
+                    process,
+                    "12",
+                    Path::new("/tmp/first/cache"),
+                    None,
+                    CleanupKind::ProjectCache,
+                    || collect("12")
+                )
+                .unwrap()
+        );
+        assert_eq!(calls.get(), 2);
+        cache.max_bytes = 0;
+        assert!(
+            cache
+                .references_or_collect(
+                    process,
+                    "13",
+                    Path::new("/tmp/first/cache"),
+                    None,
+                    CleanupKind::ProjectCache,
+                    || collect("13")
+                )
+                .unwrap()
+        );
+        assert!(cache.entries.is_empty());
+        assert!(
+            cache
+                .references_or_collect(
+                    process,
+                    "13",
+                    Path::new("/tmp/first/cache"),
+                    None,
+                    CleanupKind::ProjectCache,
+                    || collect("13")
+                )
+                .unwrap()
+        );
+        assert_eq!(calls.get(), 4);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_snapshot_errors_are_not_cached() {
+        use std::cell::Cell;
+
+        let mut cache = PrivilegedProcessCache::default();
+        let calls = Cell::new(0);
+        for _ in 0..2 {
+            let result = cache.references_or_collect(
+                Path::new("/proc/123"),
+                "11",
+                Path::new("/tmp/cache"),
+                None,
+                CleanupKind::ProjectCache,
+                || {
+                    calls.set(calls.get() + 1);
+                    bail!("inspection unavailable")
+                },
+            );
+            assert!(result.is_err());
+        }
+        assert_eq!(calls.get(), 2);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn manual_recent_cache_cleanup_revalidates_changes_after_planning() {
+        let (directory, config, repository) = fresh_cache_fixture();
+        let plan = fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent);
+        assert_eq!(plan.candidates.len(), 1);
+        fs::write(
+            repository.root.join(".turbo/new-file"),
+            b"preserve new work",
+        )
+        .unwrap();
+        let audit = AuditLog::at(directory.path().join("audit.jsonl"));
+        let result = execute_cleanup(&config, &plan, CleanupMode::Execute, &audit).unwrap();
+        assert_eq!(result.deleted_logical_bytes, 0);
+        assert_eq!(result.actions[0].outcome, CleanupActionOutcome::Skipped);
+        assert!(repository.root.join(".turbo/new-file").exists());
+    }
+
+    #[test]
+    fn manual_recent_cache_cleanup_preserves_tracked_unignored_and_symlinked_paths() {
+        let (directory, config, repository) = fresh_cache_fixture();
+        assert!(
+            Command::new("git")
+                .args(["add", "-f", ".turbo/artifact"])
+                .current_dir(&repository.root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent)
+                .candidates
+                .is_empty()
+        );
+        assert!(
+            Command::new("git")
+                .args(["rm", "--cached", "-q", ".turbo/artifact"])
+                .current_dir(&repository.root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(
+            repository.root.join(".gitignore"),
+            b"/target\n/.next\n/node_modules\n",
+        )
+        .unwrap();
+        assert!(
+            fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent)
+                .candidates
+                .is_empty()
+        );
+        fs::write(
+            repository.root.join(".gitignore"),
+            b"/.turbo\n/target\n/.next\n/node_modules\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent)
+                .candidates
+                .len(),
+            1
+        );
+        fs::rename(
+            repository.root.join(".turbo"),
+            directory.path().join("preserved-cache"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            repository.root.join("preserved-cache"),
+            repository.root.join(".turbo"),
+        )
+        .unwrap();
+        assert!(
+            fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent)
+                .candidates
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read(repository.root.join("preserved-cache/artifact")).unwrap(),
+            b"regenerable"
+        );
+    }
+
     fn age(path: &Path) {
         let status = Command::new("touch")
             .args(["-d", "40 days ago"])
@@ -1144,6 +2170,48 @@ mod tests {
 
         assert!(is_guard_quarantine_path(&quarantine));
         assert!(discover_project_roots(&root).is_empty());
+    }
+
+    #[test]
+    fn nested_repositories_own_their_project_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path();
+        let owned = outer.join("workspace");
+        fs::create_dir(&owned).unwrap();
+        fs::write(owned.join("Cargo.toml"), "[workspace]").unwrap();
+        for (name, worktree) in [("checkout", false), ("linked", true)] {
+            let nested = outer.join(name);
+            fs::create_dir(&nested).unwrap();
+            if worktree {
+                fs::write(nested.join(".git"), "gitdir: /elsewhere").unwrap();
+            } else {
+                fs::create_dir(nested.join(".git")).unwrap();
+            }
+            fs::write(nested.join("package.json"), "{}").unwrap();
+            let cache = nested.join(".next");
+            fs::create_dir(&cache).unwrap();
+            assert_eq!(
+                discover_project_roots(&nested),
+                std::slice::from_ref(&nested)
+            );
+            assert!(
+                validate_git_state(outer, &cache)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("repository boundary")
+            );
+        }
+        assert_eq!(discover_project_roots(outer), [owned]);
+    }
+
+    #[test]
+    fn git_metadata_inside_an_output_preserves_the_whole_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("vendor-copy");
+        fs::create_dir(&checkout).unwrap();
+        fs::write(checkout.join(".git"), "gitdir: ../nested").unwrap();
+        assert!(profile_tree(temp.path()).is_err());
+        assert!(checkout.join(".git").is_file());
     }
 
     #[test]
@@ -1284,7 +2352,7 @@ mod tests {
         let candidate =
             inspect_candidate(&config, &path, CleanupKind::JavaScriptCache, None, 1).unwrap();
         let plan = CleanupPlan {
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             pressure: DiskPressure::Pressure,
             candidates: vec![candidate],
             skips: Vec::new(),
@@ -1354,15 +2422,288 @@ mod tests {
         fs::set_permissions(&protected, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn only_inert_user_managers_may_be_inaccessible() {
-        assert!(is_inert_user_manager(b"/usr/lib/systemd/systemd\0--user\0"));
-        assert!(is_inert_user_manager(b"(sd-pam)\0"));
-        assert!(is_inert_user_manager(
-            b"/home/runner/runners/bin/Runner.Listener\0"
+    fn nondumpable_process_fixture() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+
+        if std::env::var_os("GUARD_TEST_NONDUMPABLE").is_none() {
+            return;
+        }
+        let _held_file = std::env::var_os("GUARD_TEST_HELD_FILE")
+            .map(|path| fs::File::open(path).expect("open synthetic fixture"));
+        let mapping = std::env::var_os("GUARD_TEST_MAPPED_FILE").map(|path| {
+            let file = fs::File::open(path).expect("open synthetic mapping fixture");
+            // SAFETY: the fixture is nonempty, read-only, and unmapped before exit.
+            let mapping = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    9,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(mapping, libc::MAP_FAILED);
+            mapping
+        });
+        // SAFETY: this changes only the synthetic child process.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+        println!("GUARD_TEST_PROCESS_READY");
+        std::io::stdout().flush().unwrap();
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input).unwrap();
+        if let Some(mapping) = mapping {
+            // SAFETY: this address and length are the successful mmap above.
+            assert_eq!(unsafe { libc::munmap(mapping, 9) }, 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a working non-interactive sudo for read-only proc inspection"]
+    fn nondumpable_process_only_blocks_the_cache_it_references() {
+        use std::io::{BufRead, BufReader};
+
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        assert!(
+            Command::new("/usr/bin/sudo")
+                .args(["-n", "true"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let temporary = tempdir().unwrap();
+        let cache = temporary.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let file = cache.join("fixture");
+        fs::write(&file, b"synthetic").unwrap();
+        let cache = fs::canonicalize(cache).unwrap();
+        for mode in ["unrelated", "open-fd", "mapped-only"] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "cleanup::tests::nondumpable_process_fixture",
+                    "--nocapture",
+                ])
+                .env("GUARD_TEST_NONDUMPABLE", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            if mode == "open-fd" {
+                command.env("GUARD_TEST_HELD_FILE", &file);
+            } else if mode == "mapped-only" {
+                command.env("GUARD_TEST_MAPPED_FILE", &file);
+            }
+            let mut child = Fixture(command.spawn().unwrap());
+            let mut output = BufReader::new(child.0.stdout.take().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(
+                    output.read_line(&mut line).unwrap(),
+                    0,
+                    "fixture terminated"
+                );
+                if line.contains("GUARD_TEST_PROCESS_READY") {
+                    break;
+                }
+            }
+            assert_eq!(
+                path_is_in_use(&cache, None, CleanupKind::ProjectCache).unwrap(),
+                mode != "unrelated",
+                "mode={mode}"
+            );
+            drop(child.0.stdin.take());
+            assert!(child.0.wait().unwrap().success());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a working non-interactive sudo for read-only proc inspection"]
+    fn active_repository_working_directory_protects_only_its_artifacts() {
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temp = tempdir().unwrap();
+        let active = temp.path().join("active");
+        let inactive = temp.path().join("inactive");
+        for root in [&active, &inactive] {
+            fs::create_dir_all(root.join(".next")).unwrap();
+        }
+        let _child = Fixture(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .current_dir(&active)
+                .spawn()
+                .unwrap(),
+        );
+        assert!(
+            path_is_in_use(&active.join(".next"), Some(&active), CleanupKind::NextBuild).unwrap()
+        );
+        assert!(
+            !path_is_in_use(
+                &inactive.join(".next"),
+                Some(&inactive),
+                CleanupKind::NextBuild
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn active_package_tools_protect_only_their_cache_family() {
+        assert!(active_tool_may_use_cache(
+            CleanupKind::GoCache,
+            b"/usr/local/go/bin/go\0test\0"
         ));
-        assert!(is_inert_user_manager(b"Runner.Worker\0"));
-        assert!(!is_inert_user_manager(b"codex\0build\0"));
+        assert!(!active_tool_may_use_cache(
+            CleanupKind::RustCache,
+            b"/usr/local/go/bin/go\0test\0"
+        ));
+        assert!(active_tool_may_use_cache(
+            CleanupKind::JavaScriptCache,
+            b"node\0/usr/lib/npm/bin/npm-cli.js\0install\0"
+        ));
+        assert!(active_tool_may_use_cache(
+            CleanupKind::RustCache,
+            b"/home/user/.cargo/bin/cargo\0check\0"
+        ));
+        assert!(!active_tool_may_use_cache(
+            CleanupKind::GoCache,
+            b"/usr/bin/gopher\0"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_go_cache_does_not_claim_the_idle_default() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let proc = temp.path().join("process");
+        let candidate = temp.path().join(".cache/go-build");
+        let alternate = temp.path().join("isolated");
+        fs::create_dir_all(proc.join("ns")).unwrap();
+        fs::create_dir_all(candidate.join("nested")).unwrap();
+        fs::create_dir(&alternate).unwrap();
+        symlink("/usr/bin/go", proc.join("exe")).unwrap();
+        symlink("/proc/self/ns/mnt", proc.join("ns/mnt")).unwrap();
+        symlink("/proc/self/root", proc.join("root")).unwrap();
+        let alias = temp.path().join("alias");
+        symlink(&candidate, &alias).unwrap();
+
+        let separate = || go_uses_separate_build_cache(&proc, &candidate, CleanupKind::GoCache);
+        assert!(!separate());
+        for (setting, expected) in [
+            (format!("GOCACHE={}", alternate.display()), true),
+            (
+                format!("GOCACHE={}\0GOCACHEPROG=custom", alternate.display()),
+                false,
+            ),
+            (format!("GOCACHE={}", candidate.display()), false),
+            (format!("GOCACHE={}/nested", alias.display()), false),
+            (format!("GOCACHE={}", temp.path().display()), false),
+            ("GOCACHE=relative".into(), false),
+            ("UNRELATED=1".into(), false),
+        ] {
+            fs::write(proc.join("environ"), setting).unwrap();
+            assert_eq!(separate(), expected);
+        }
+        fs::write(
+            proc.join("environ"),
+            format!("GOCACHE={}", alternate.display()),
+        )
+        .unwrap();
+        assert!(!go_uses_separate_build_cache(
+            &proc,
+            &temp.path().join("go/pkg/mod/cache"),
+            CleanupKind::GoCache
+        ));
+        fs::remove_file(proc.join("ns/mnt")).unwrap();
+        assert!(!separate());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_paths_preserve_spaces_and_path_boundaries() {
+        let maps = b"1000-2000 r--p 0 00:00 0 /tmp/cache other/file\n2000-3000 rw-p 0 00:00 0 [heap]\n3000-4000 r--p 0 00:00 0 /tmp/cache/file with spaces (deleted)\n";
+        assert!(mapped_path_hits(maps, Path::new("/tmp/cache")).unwrap());
+        assert!(!mapped_path_hits(maps, Path::new("/tmp/cache-other")).unwrap());
+        assert!(mapped_path_hits(b"invalid\n", Path::new("/tmp/cache")).is_err());
+        let escaped = b"1000-2000 r--p 0 00:00 0 /tmp/cache\\012name/file\n";
+        assert!(mapped_path_hits(escaped, Path::new("/tmp/cache\nname")).unwrap());
+        assert!(mapped_path_hits(escaped, Path::new("/tmp/cache\\012name")).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn command_line_detects_exact_cache_arguments_without_prefix_confusion() {
+        let candidate = Path::new("/tmp/cache");
+        assert!(command_line_hits(
+            b"tool\0--target=/tmp/cache/debug\0",
+            candidate
+        ));
+        assert!(!command_line_hits(
+            b"tool\0--target=/tmp/cache-other\0",
+            candidate
+        ));
+        let non_utf8 = std::ffi::OsStr::from_bytes(b"/tmp/\xff-cache");
+        assert!(command_line_hits(
+            b"tool\0/tmp/\xff-cache/file\0",
+            Path::new(non_utf8)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn readonly_process_helper_fails_closed_when_unavailable() {
+        assert!(run_readonly_proc_command("/nonexistent-guard-test-command", &[]).is_err());
+        assert!(process_start_time(Path::new("/proc/0"), effective_uid()).is_err());
+    }
+
+    #[test]
+    fn report_marks_uninspectable_process_as_cleanup_blocked() {
+        let now = Timestamp::now();
+        let mut report = CleanupReport {
+            started_at: now,
+            finished_at: now,
+            mode: CleanupMode::Execute,
+            pressure: DiskPressure::Emergency,
+            planned_logical_bytes: 0,
+            deleted_logical_bytes: 0,
+            actions: Vec::new(),
+            planning_skips: Vec::new(),
+            failures: 0,
+        };
+        assert!(!report.process_inspection_blocked());
+        report.planning_skips.push(CleanupSkip {
+            path: PathBuf::from("/cache"),
+            reason: format!("{PROCESS_INSPECTION_ERROR_PREFIX}42: unavailable"),
+        });
+        assert!(report.process_inspection_blocked());
+        report.planning_skips.clear();
+        report.actions.push(CleanupAction {
+            path: PathBuf::from("/cache"),
+            kind: CleanupKind::GoCache,
+            outcome: CleanupActionOutcome::Skipped,
+            logical_bytes: 0,
+            detail: format!("{PROCESS_INSPECTION_ERROR_PREFIX}42: unavailable"),
+        });
+        assert!(report.process_inspection_blocked());
     }
 
     #[cfg(target_os = "linux")]
@@ -1444,8 +2785,8 @@ mod tests {
     #[test]
     fn build_report_uses_logical_not_physical_reclaimed_bytes() {
         let report = CleanupReport {
-            started_at: Utc::now(),
-            finished_at: Utc::now(),
+            started_at: Timestamp::now(),
+            finished_at: Timestamp::now(),
             mode: CleanupMode::Execute,
             pressure: DiskPressure::Pressure,
             planned_logical_bytes: GIB,
