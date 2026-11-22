@@ -10,8 +10,8 @@ The design is deliberately conservative: uncertainty preserves data.
 
 ## Status
 
-The current source version is `0.1.2`. `guard --version` reports the full
-source commit. `guard status` shows a compact version and short commit in text;
+`guard --version` reports the version and full source commit.
+`guard status` shows a compact version and short commit in text;
 its JSON report includes full commit and installation identity. Release
 archives ship `SHA256SUMS` and a complete install tree. No stable public
 release has been published yet; review a dry run before enabling real cleanup
@@ -107,6 +107,10 @@ guard history                          # View recent cleanup audit log entries
 ### Key configuration notes
 
 - **Custom thresholds:** Adjust disk pressure, scan roots, and protected paths in `~/.config/guardwsl/config.toml`. See the complete [configuration reference](docs/CONFIGURATION.md).
+- **Large toolchain caches:** Set `cleanup.critical_toolchain_min_bytes` to
+  consider recognized Go and Rust caches, Rust `target` directories, and
+  `sccache` sooner when physical disk pressure is critical. The threshold is
+  per directory and every candidate must pass the existing safety checks.
 - Upgrades remove GuardWSL-managed legacy tool shims and their marked PATH entries.
 - **Host telemetry unavailable:** the monitor reports unhealthy and continues
   conservative age-based cleanup without inventing a physical free-space

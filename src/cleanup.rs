@@ -96,6 +96,8 @@ pub struct CleanupCandidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repository: Option<PathBuf>,
     pub minimum_age_hours: u64,
+    #[serde(default)]
+    pub early_toolchain_reclaim: bool,
     pub estimated_bytes: u64,
     pub newest_modified_at: Timestamp,
     pub device: u64,
@@ -375,9 +377,10 @@ where
                     "cleanup",
                     AuditOutcome::Planned,
                     format!(
-                        "dry run: logical {} removal; minimum_age_hours={}; no mutation performed",
+                        "dry run: logical {} removal; minimum_age_hours={}; early_toolchain_reclaim={}; no mutation performed",
                         planned.kind.as_str(),
-                        planned.minimum_age_hours
+                        planned.minimum_age_hours,
+                        planned.early_toolchain_reclaim
                     ),
                 )
                 .for_path(&planned.path)
@@ -393,12 +396,14 @@ where
             continue;
         }
 
-        let current = match inspect_candidate(
+        let current = match inspect_candidate_with_cache(
             config,
             &planned.path,
             planned.kind,
             planned.repository.as_deref(),
             planned.minimum_age_hours,
+            plan.pressure,
+            &mut PrivilegedProcessCache::default(),
         ) {
             Ok(candidate)
                 if candidate.device == planned.device
@@ -446,9 +451,10 @@ where
                 "cleanup",
                 AuditOutcome::Planned,
                 format!(
-                    "logical {} removal; minimum_age_hours={}",
+                    "logical {} removal; minimum_age_hours={}; early_toolchain_reclaim={}",
                     current.kind.as_str(),
-                    current.minimum_age_hours
+                    current.minimum_age_hours,
+                    current.early_toolchain_reclaim
                 ),
             )
             .for_path(&current.path)
@@ -780,6 +786,7 @@ fn push_candidate(
         kind,
         repository,
         minimum_age_hours,
+        plan.pressure,
         &mut state.processes,
     ) {
         Ok(candidate) => plan.candidates.push(candidate),
@@ -790,6 +797,7 @@ fn push_candidate(
     }
 }
 
+#[cfg(test)]
 fn inspect_candidate(
     config: &GuardConfig,
     path: &Path,
@@ -803,6 +811,7 @@ fn inspect_candidate(
         kind,
         repository,
         minimum_age_hours,
+        DiskPressure::Healthy,
         &mut PrivilegedProcessCache::default(),
     )
 }
@@ -813,6 +822,7 @@ fn inspect_candidate_with_cache(
     kind: CleanupKind,
     repository: Option<&Path>,
     minimum_age_hours: u64,
+    pressure: DiskPressure,
     process_cache: &mut PrivilegedProcessCache,
 ) -> Result<CleanupCandidate> {
     let metadata = fs::symlink_metadata(path)?;
@@ -855,7 +865,16 @@ fn inspect_candidate_with_cache(
     let age = SystemTime::now()
         .duration_since(profile.newest_modified)
         .context("candidate mtime is in the future")?;
-    if age < Duration::from_secs(minimum_age_hours.saturating_mul(3600)) {
+    let too_recent = age < Duration::from_secs(minimum_age_hours.saturating_mul(3600));
+    let early_toolchain_reclaim = too_recent
+        && qualifies_for_early_toolchain_reclaim(
+            pressure,
+            kind,
+            &canonical,
+            profile.allocated_bytes,
+            config.cleanup.critical_toolchain_min_bytes,
+        );
+    if too_recent && !early_toolchain_reclaim {
         bail!(
             "candidate is {}h old; minimum age is {}h",
             age.as_secs() / 3600,
@@ -867,11 +886,31 @@ fn inspect_candidate_with_cache(
         kind,
         repository: repository.map(Path::to_path_buf),
         minimum_age_hours,
+        early_toolchain_reclaim,
         estimated_bytes: profile.bytes,
         newest_modified_at: Timestamp::try_from(profile.newest_modified)?,
         device: profile.device,
         inode: profile.inode,
     })
+}
+
+fn qualifies_for_early_toolchain_reclaim(
+    pressure: DiskPressure,
+    kind: CleanupKind,
+    path: &Path,
+    allocated_bytes: u64,
+    minimum_bytes: u64,
+) -> bool {
+    if minimum_bytes == 0
+        || allocated_bytes < minimum_bytes
+        || !matches!(pressure, DiskPressure::Critical | DiskPressure::Emergency)
+    {
+        return false;
+    }
+    matches!(
+        kind,
+        CleanupKind::GoCache | CleanupKind::RustCache | CleanupKind::RustTarget
+    ) || (kind == CleanupKind::ToolCache && path.ends_with(".cache/sccache"))
 }
 
 fn normalize_protected_path(path: &Path) -> Result<PathBuf> {
@@ -1009,6 +1048,7 @@ fn git_status<const N: usize>(repository: &Path, args: [&str; N]) -> Result<i32>
 #[derive(Debug)]
 struct TreeProfile {
     bytes: u64,
+    allocated_bytes: u64,
     newest_modified: SystemTime,
     device: u64,
     inode: u64,
@@ -1027,6 +1067,7 @@ fn profile_tree(path: &Path) -> Result<TreeProfile> {
     #[cfg(not(target_os = "linux"))]
     let (device, inode) = (0, 0);
     let mut bytes = 0_u64;
+    let mut allocated_bytes = 0_u64;
     let mut newest = root.modified()?;
     let mounts = mount_points()?;
     let mut hard_links: HashMap<(u64, u64), HardLinkTally> = HashMap::new();
@@ -1055,19 +1096,27 @@ fn profile_tree(path: &Path) -> Result<TreeProfile> {
             bail!("candidate crosses a filesystem at {}", entry_path.display())
         }
         #[cfg(target_os = "linux")]
-        if metadata.is_file() && metadata.nlink() > 1 {
-            let key = (metadata.dev(), metadata.ino());
-            hard_links
-                .entry(key)
-                .and_modify(|tally| {
-                    tally.nlink = tally.nlink.max(metadata.nlink());
-                    tally.names_inside += 1;
-                })
-                .or_insert_with(|| HardLinkTally {
+        {
+            let mut first_name = true;
+            if metadata.is_file() && metadata.nlink() > 1 {
+                let key = (metadata.dev(), metadata.ino());
+                let tally = hard_links.entry(key).or_insert_with(|| HardLinkTally {
                     nlink: metadata.nlink(),
-                    names_inside: 1,
+                    names_inside: 0,
                     sample: entry_path.to_path_buf(),
                 });
+                tally.nlink = tally.nlink.max(metadata.nlink());
+                tally.names_inside += 1;
+                first_name = tally.names_inside == 1;
+            }
+            if first_name {
+                allocated_bytes =
+                    allocated_bytes.saturating_add(metadata.blocks().saturating_mul(512));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            allocated_bytes = allocated_bytes.saturating_add(metadata.len());
         }
         if !metadata.is_dir() && !metadata.is_file() && !metadata.file_type().is_symlink() {
             bail!(
@@ -1090,6 +1139,7 @@ fn profile_tree(path: &Path) -> Result<TreeProfile> {
     }
     Ok(TreeProfile {
         bytes,
+        allocated_bytes,
         newest_modified: newest,
         device,
         inode,
@@ -2335,6 +2385,148 @@ mod tests {
             short_target.minimum_age_hours,
             config.cleanup.critical_min_age_hours
         );
+    }
+
+    #[test]
+    fn early_reclaim_requires_critical_pressure_and_a_known_toolchain_cache() {
+        let limit = 2_u64 << 30;
+        let path = Path::new("/cache");
+        for pressure in [DiskPressure::Healthy, DiskPressure::Pressure] {
+            assert!(!qualifies_for_early_toolchain_reclaim(
+                pressure,
+                CleanupKind::GoCache,
+                path,
+                limit,
+                limit,
+            ));
+        }
+        for kind in [
+            CleanupKind::GoCache,
+            CleanupKind::RustCache,
+            CleanupKind::RustTarget,
+        ] {
+            assert!(qualifies_for_early_toolchain_reclaim(
+                DiskPressure::Critical,
+                kind,
+                path,
+                limit,
+                limit,
+            ));
+        }
+        for kind in [
+            CleanupKind::ProjectCache,
+            CleanupKind::JavaScriptCache,
+            CleanupKind::NextBuild,
+            CleanupKind::NodeModules,
+            CleanupKind::ToolCache,
+        ] {
+            assert!(!qualifies_for_early_toolchain_reclaim(
+                DiskPressure::Emergency,
+                kind,
+                path,
+                limit,
+                limit,
+            ));
+        }
+        assert!(qualifies_for_early_toolchain_reclaim(
+            DiskPressure::Emergency,
+            CleanupKind::ToolCache,
+            Path::new("/user/.cache/sccache"),
+            limit,
+            limit,
+        ));
+        for (bytes, threshold) in [(limit - 1, limit), (limit, 0)] {
+            assert!(!qualifies_for_early_toolchain_reclaim(
+                DiskPressure::Critical,
+                CleanupKind::GoCache,
+                path,
+                bytes,
+                threshold,
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn critical_recent_target_revalidates_size_and_process_before_removal() {
+        let directory = tempdir().unwrap();
+        let repo = fs::canonicalize(directory.path()).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(repo.join(".gitignore"), b"/target\n").unwrap();
+        fs::write(
+            repo.join("Cargo.toml"),
+            b"[package]\nname='sample'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let target = repo.join("target");
+        fs::create_dir(&target).unwrap();
+        let object = target.join("object");
+        fs::write(&object, vec![0xA5; 256 * 1024]).unwrap();
+        let mut config = GuardConfig::default();
+        config.cleanup.critical_toolchain_min_bytes = 128 * 1024;
+        let inspect = || {
+            inspect_candidate_with_cache(
+                &config,
+                &target,
+                CleanupKind::RustTarget,
+                Some(&repo),
+                1,
+                DiskPressure::Critical,
+                &mut PrivilegedProcessCache::default(),
+            )
+            .unwrap()
+        };
+        let candidate = inspect();
+        assert!(candidate.early_toolchain_reclaim);
+        let mut plan = CleanupPlan {
+            created_at: Timestamp::now(),
+            pressure: DiskPressure::Critical,
+            candidates: vec![candidate],
+            skips: Vec::new(),
+        };
+        let audit = AuditLog::at(repo.join("audit.jsonl"));
+
+        fs::File::create(&object)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+        let sparse = profile_tree(&target).unwrap();
+        assert!(sparse.bytes > config.cleanup.critical_toolchain_min_bytes);
+        assert!(sparse.allocated_bytes < config.cleanup.critical_toolchain_min_bytes);
+        let report = execute_cleanup(&config, &plan, CleanupMode::Execute, &audit).unwrap();
+        assert_eq!(report.actions[0].outcome, CleanupActionOutcome::Skipped);
+        assert!(report.actions[0].detail.contains("minimum age"));
+
+        fs::write(&object, vec![0xA5; 256 * 1024]).unwrap();
+        plan.candidates[0] = inspect();
+        let mut process = None;
+        let busy = execute_cleanup_with_hook(&config, &plan, CleanupMode::Execute, &audit, |_| {
+            process = Some(
+                Command::new("sleep")
+                    .arg("15")
+                    .current_dir(&target)
+                    .spawn()
+                    .unwrap(),
+            );
+        });
+        let mut child = process.unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let busy = busy.unwrap();
+        assert_eq!(busy.actions[0].outcome, CleanupActionOutcome::Skipped);
+        assert!(busy.actions[0].detail.contains("in use immediately"));
+        assert!(object.exists());
+
+        let idle = execute_cleanup(&config, &plan, CleanupMode::Execute, &audit).unwrap();
+        assert_eq!(idle.actions[0].outcome, CleanupActionOutcome::Removed);
+        assert!(!target.exists());
     }
 
     #[test]

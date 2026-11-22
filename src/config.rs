@@ -155,6 +155,7 @@ pub struct CleanupConfig {
     pub build_min_age_hours: u64,
     pub node_modules_min_age_hours: u64,
     pub critical_min_age_hours: u64,
+    pub critical_toolchain_min_bytes: u64,
     pub max_actions_per_cycle: usize,
 }
 
@@ -168,6 +169,7 @@ impl Default for CleanupConfig {
             build_min_age_hours: 7 * 24,
             node_modules_min_age_hours: 30 * 24,
             critical_min_age_hours: 24,
+            critical_toolchain_min_bytes: 0,
             max_actions_per_cycle: 20,
         }
     }

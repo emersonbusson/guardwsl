@@ -70,6 +70,7 @@ cache_min_age_hours = 168
 build_min_age_hours = 168
 node_modules_min_age_hours = 720
 critical_min_age_hours = 24
+critical_toolchain_min_bytes = 0
 max_actions_per_cycle = 20
 
 [monitor]
@@ -105,12 +106,22 @@ space and may compress category age requirements, but never below
 `critical_min_age_hours`. It still applies every ownership, Git, mount,
 file-type, hard-link, process-use, and identity check.
 
+`critical_toolchain_min_bytes` is an optional size threshold for early cleanup.
+Set it to `2147483648` for 2 GiB, or `0` to use standard retention. In Critical
+or Emergency pressure, the threshold applies to each allowlisted Go cache,
+Cargo cache, Rust `target` directory, and `sccache` directory. It measures
+allocated guest blocks. Sparse files and hard links inside the same tree
+cannot inflate that measurement. The monitor considers the candidate on its
+next pressure cleanup cycle, with the usual protected-path and active-process
+checks. It rechecks size and safety before each deletion. A missing host probe
+keeps standard retention.
+
 For an explicit one-time cleanup of recent caches, use
 `guard clean --all-caches --dry-run`, review the candidates, then remove
 `--dry-run` to execute. This bypasses cache age and the host-target logical
 budget without changing any configured value. Build and `node_modules` ages,
 the action ceiling, and all safety checks remain enforced. The monitor never
-uses this override. Zero remains invalid for configured age fields.
+uses this manual override. Zero remains invalid for configured age fields.
 
 Set `cleanup.enabled = false` to disable automatic and explicit cleanup.
 

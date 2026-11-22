@@ -12,8 +12,8 @@ O desenho é deliberadamente conservador: na dúvida, os dados são preservados.
 
 ## Status
 
-A versão atual do código é `0.1.2`. `guard --version` mostra o SHA completo
-do código-fonte. O texto de `guard status` mantém versão e SHA curto; o JSON
+`guard --version` mostra a versão e o SHA completo do código-fonte.
+O texto de `guard status` mantém versão e SHA curto; o JSON
 inclui o SHA completo e os dados de instalação. Os arquivos de release
 incluem `SHA256SUMS` e a árvore de instalação completa. Ainda não há uma
 versão pública estável; revise um dry-run antes de ativar limpeza real em
@@ -110,6 +110,11 @@ guard history                          # Exibe o histórico de auditoria das lim
 ### Notas importantes de configuração
 
 - **Limites personalizados:** ajuste pressão de disco, raízes e caminhos protegidos em `~/.config/guardwsl/config.toml`.
+- **Caches grandes de toolchain:** `cleanup.critical_toolchain_min_bytes`
+  pode antecipar a limpeza de caches reconhecidos de Go e Cargo, pastas
+  Rust `target` e `sccache` sob pressão crítica. Use `2147483648` para 2 GiB
+  por pasta. O Guard revalida o tamanho, os caminhos protegidos e o uso por
+  processos antes da exclusão.
 - Uma atualização remove shims antigos gerenciados pelo GuardWSL e suas entradas marcadas no `PATH`.
 - **Telemetria do host indisponível:** o monitor informa falha e continua a
   limpeza conservadora por idade sem inventar espaço físico livre. A limpeza
