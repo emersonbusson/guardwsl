@@ -56,8 +56,8 @@ jobs:
         run: rustup toolchain install --no-self-update
       - name: Install pinned policy tools
         run: |
-          cargo install cargo-audit --version 0.22.2 --locked
-          cargo install cargo-deny --version 0.19.9 --locked
+          cargo install cargo-audit --version 0.23.0 --locked
+          cargo install cargo-deny --version 0.22.0 --locked
       - name: Audit dependencies
         run: cargo audit --deny warnings
       - name: Check dependency policy
