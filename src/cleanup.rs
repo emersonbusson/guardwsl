@@ -1148,7 +1148,7 @@ fn path_is_in_use_with_cache(
         let is_self = pid_bytes == current_pid.as_str();
         let metadata = match process.metadata() {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if proc_entry_disappeared(&error) => continue,
             Err(error) => {
                 bail!("{PROCESS_INSPECTION_ERROR_PREFIX}{}: {error}", pid_bytes)
             }
@@ -1169,7 +1169,7 @@ fn path_is_in_use_with_cache(
                     return Ok(true);
                 }
                 Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) if proc_entry_disappeared(&error) => {}
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied && !is_self => {
                     inspection_denied = true;
                 }
@@ -1192,7 +1192,7 @@ fn path_is_in_use_with_cache(
                     match fs::read_link(fd.path()) {
                         Ok(path) if reference_hits(&path, candidate) => return Ok(true),
                         Ok(_) => {}
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) if proc_entry_disappeared(&error) => {}
                         Err(error)
                             if error.kind() == io::ErrorKind::PermissionDenied && !is_self =>
                         {
@@ -1205,7 +1205,7 @@ fn path_is_in_use_with_cache(
                     }
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if proc_entry_disappeared(&error) => {}
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied && !is_self => {
                 inspection_denied = true;
             }
@@ -1222,7 +1222,7 @@ fn path_is_in_use_with_cache(
                     return Ok(true);
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if proc_entry_disappeared(&error) => continue,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied && !is_self => {
                 inspection_denied = true;
             }
@@ -1232,7 +1232,7 @@ fn path_is_in_use_with_cache(
         }
         let command_line = match fs::read(process.path().join("cmdline")) {
             Ok(command_line) => command_line,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if proc_entry_disappeared(&error) => continue,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied && !is_self => {
                 inspection_denied = true;
                 Vec::new()
@@ -1267,6 +1267,12 @@ fn path_is_in_use_with_cache(
             ) {
                 Ok(true) => return Ok(true),
                 Ok(false) => {}
+                Err(_)
+                    if fs::metadata(process.path()).is_err_and(|e| proc_entry_disappeared(&e))
+                        || process_is_zombie(&process.path()) =>
+                {
+                    continue;
+                }
                 Err(error) => {
                     bail!("{PROCESS_INSPECTION_ERROR_PREFIX}{}: {error:#}", pid_bytes)
                 }
@@ -1389,6 +1395,11 @@ fn go_uses_separate_build_cache(process: &Path, candidate: &Path, kind: CleanupK
 #[cfg(not(target_os = "linux"))]
 fn go_uses_separate_build_cache(_process: &Path, _candidate: &Path, _kind: CleanupKind) -> bool {
     false
+}
+
+// Linux can return ENOENT or ESRCH for the same /proc read during exit.
+fn proc_entry_disappeared(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 fn process_is_zombie(process: &Path) -> bool {
@@ -1834,6 +1845,16 @@ mod tests {
     }
 
     #[test]
+    fn exited_proc_entries_and_inspection_errors_are_distinct() {
+        for code in [libc::ENOENT, libc::ESRCH] {
+            assert!(proc_entry_disappeared(&io::Error::from_raw_os_error(code)));
+        }
+        for code in [libc::EACCES, libc::EPERM, libc::EIO] {
+            assert!(!proc_entry_disappeared(&io::Error::from_raw_os_error(code)));
+        }
+    }
+
+    #[test]
     fn process_opened_after_planning_is_preserved_on_execution() {
         let (directory, config, repository) = fresh_cache_fixture();
         let plan = fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent);
@@ -1857,7 +1878,7 @@ mod tests {
     fn process_opened_after_audit_is_preserved_before_quarantine() {
         let (directory, config, repository) = fresh_cache_fixture();
         let plan = fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent);
-        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates.len(), 1, "{:?}", plan.skips);
         let audit = AuditLog::at(directory.path().join("audit.jsonl"));
         let mut held_open = None;
         let report =
