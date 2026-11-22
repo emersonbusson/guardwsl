@@ -5,6 +5,13 @@ All notable changes to GuardWSL will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project intends to use [Semantic Versioning](https://semver.org/).
 
+## [0.3.0](https://github.com/emersonbusson/guardwsl/compare/v0.2.0...v0.3.0) (2026-11-22)
+
+
+### Features
+
+* **cleanup:** reclaim idle caches under disk pressure ([85c2c1d](https://github.com/emersonbusson/guardwsl/commit/85c2c1d109bc7b352d5102dd31d7fda77c0ac6e4))
+
 ## [0.2.0](https://github.com/emersonbusson/guardwsl/compare/v0.1.2...v0.2.0) (2026-10-01)
 
 
