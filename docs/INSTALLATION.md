@@ -5,7 +5,7 @@
 - Native Linux or WSL2 with systemd enabled;
 - on WSL2, Windows PowerShell interoperability;
 - Bash;
-- for a source install only: Rust 1.98.0, Cargo, and a clean Git checkout.
+- for a source install only: Rust 1.100.0, Cargo, and a clean Git checkout.
 
 Review `scripts/install-linux.sh` before running it. The installer is
 user-scoped and does not require a Windows service or a root daemon.
@@ -29,7 +29,8 @@ user-scoped and does not require a Windows service or a root daemon.
 
 The release tree contains `guard`, `scripts/`, `systemd/`, documentation, and
 licenses. When the installer finds a bundled `guard` binary and no `.git`
-directory, it installs that binary directly and does not invoke Cargo.
+directory, it installs that binary directly and does not invoke Cargo. Upgrades
+remove GuardWSL-managed legacy tool shims and their marked PATH entries.
 
 ## Install from source
 
@@ -45,12 +46,11 @@ exact source commit.
 ## What the installer does
 
 1. backs up every managed user file;
-2. runs the Rust tests with GuardWSL shims removed from `PATH`
-   (source install only);
+2. runs the Rust tests (source install only);
 3. builds the release binary while the existing monitor remains active
    (source install only);
-4. briefly stops the old monitor, then installs `~/.local/bin/guard`, the
-   systemd user unit, and tool shims;
+4. briefly stops the old monitor, then installs `~/.local/bin/guard` and the
+   systemd user unit;
 5. initializes or strictly normalizes the private configuration;
    on WSL2 it also records the current distribution name for backing-volume discovery;
 6. enables the monitor and waits for `guard doctor` to become healthy;
@@ -70,11 +70,9 @@ guard clean --dry-run
 
 ```text
 ~/.local/bin/guard
-~/.local/lib/guardwsl/shims/
 ~/.config/guardwsl/config.toml
 ~/.config/guardwsl/config.last-good.toml
 ~/.config/systemd/user/guardwsl.service
-~/.config/environment.d/20-guardwsl.conf
 ~/.local/state/guardwsl/
 ~/.local/state/guardwsl/install.json
 ```
@@ -83,8 +81,9 @@ guard clean --dry-run
 `guard status` shows the version and short commit in text; JSON includes the
 full commit and the install timestamp recorded in `install.json`.
 
-The installer also adds one marked PATH block to existing `.profile`,
-`.bashrc`, and `.zshrc` files. Backups live under
+Upgrades remove managed legacy shims, their environment PATH file, and marked PATH
+blocks from `.profile`, `.bashrc`, and `.zshrc`. New installs add no tool
+shims or PATH entries. Backups live under
 `~/.local/state/guardwsl/install-backups/`.
 
 ## Remove
@@ -96,6 +95,6 @@ systemctl --user disable --now guardwsl.service
 ```
 
 Then restore the desired installer backup or remove only the files listed
-above and the marked `GuardWSL shims` blocks from shell startup files. Preserve
+above. Preserve
 `~/.local/state/guardwsl/` until its audit and backup contents are no longer
 needed. Never remove an entire home, state, or configuration root recursively.

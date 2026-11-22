@@ -7,7 +7,9 @@ ExecStart=%h/.local/bin/guard monitor
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=15s
-NoNewPrivileges=true
+# Optional non-interactive sudo is used only for read-only /proc inspection
+# and guest fstrim; without it, hidden processes block every safe cleanup.
+NoNewPrivileges=false
 Nice=10
 MemoryMax=512M
 TasksMax=64

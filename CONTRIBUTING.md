@@ -26,8 +26,8 @@ cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo audit --deny warnings
-cargo deny check
-bash -n scripts/install-linux.sh scripts/install-shims.sh
+cargo deny --locked check
+bash -n scripts/install-linux.sh scripts/retire-shims.sh
 ```
 
 Deletion tests must use isolated temporary directories. Tests must never mutate

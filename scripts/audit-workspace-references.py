@@ -15,12 +15,12 @@ from pathlib import Path
 
 SEARCH_PATTERN = (
     r"(?i)(?:guard[\W_]*wsl)"
-    r"|(?:\bguard[ \t]+(?:exec|status|monitor|clean|doctor|history|config|build-info)\b)"
+    r"|(?:\bguard[ \t]+(?:exec|status|monitor|clean|doctor|history|config)\b)"
     r"|(?:\bguard[-_]exec\b)"
-    r"|(?:\bGUARDWSL_[A-Z0-9_]+\b|\bguard_executable\b|\.admission\.guard(?:\.|\b))"
+    r"|(?:\bGUARDWSL_[A-Z0-9_]+\b|\bguard_executable\b)"
     r"|(?:/usr/local/(?:bin|libexec)/guard(?:wsl)?(?:/guard)?\b)"
     r"|(?:(?:\$HOME|~)/\.local/bin/guard\b)"
-    r"|(?:\bguard(?:wsl)?[ _-]+(?:to[ _-]+cargo|degrad\w*|wrapper|admission|identity|telemetry|binary|lock|integration|tool|service|global|external|real|active)\b)"
+    r"|(?:\bguard(?:wsl)?[ _-]+(?:to[ _-]+cargo|degrad\w*|wrapper|identity|telemetry|binary|lock|integration|tool|service|global|external|real|active)\b)"
 )
 
 EXCLUDED_GLOBS = (
@@ -62,7 +62,7 @@ def is_excluded_path(relative: Path, own_relative: str) -> bool:
     ):
         return True
     posix = relative.as_posix()
-    if posix == "emersonbusson/README.md":
+    if posix in {"AGENTS.md", "emersonbusson/README.md"}:
         return True
     if parts[0] in {"vitae", "Vitae"}:
         return True
@@ -121,6 +121,7 @@ def main() -> int:
     own_relative = own_repo.relative_to(workspace).as_posix()
     globs = [
         f"!{own_relative}/**",
+        "!/AGENTS.md",
         "!vitae/**",
         "!Vitae/**",
         "!emersonbusson/README.md",
