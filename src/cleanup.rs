@@ -2358,26 +2358,10 @@ mod tests {
 
     #[test]
     fn dry_run_never_mutates_candidate() {
-        let directory = tempdir().unwrap();
-        #[cfg(target_os = "linux")]
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let path = directory.path().join("cache");
-        fs::create_dir(&path).unwrap();
-        #[cfg(target_os = "linux")]
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(path.join("x"), vec![0_u8; 32]).unwrap();
-        age(&path.join("x"));
-        age(&path);
-        let mut config = GuardConfig::default();
-        config.cleanup.protected_paths.clear();
-        let candidate =
-            inspect_candidate(&config, &path, CleanupKind::JavaScriptCache, None, 1).unwrap();
-        let plan = CleanupPlan {
-            created_at: Timestamp::now(),
-            pressure: DiskPressure::Pressure,
-            candidates: vec![candidate],
-            skips: Vec::new(),
-        };
+        let (directory, config, repository) = fresh_cache_fixture();
+        let path = repository.root.join(".turbo");
+        let plan = fresh_cache_plan(&config, &repository, CacheAgePolicy::IncludeRecent);
+        assert_eq!(plan.candidates.len(), 1, "{:?}", plan.skips);
         let audit = AuditLog::at(directory.path().join("audit.jsonl"));
         #[cfg(target_os = "linux")]
         let identity_before = {
@@ -2386,7 +2370,7 @@ mod tests {
         };
         let report = execute_cleanup(&config, &plan, CleanupMode::DryRun, &audit).unwrap();
         assert!(path.exists());
-        assert_eq!(fs::read(path.join("x")).unwrap(), vec![0_u8; 32]);
+        assert_eq!(fs::read(path.join("artifact")).unwrap(), b"regenerable");
         #[cfg(target_os = "linux")]
         {
             let metadata = fs::symlink_metadata(&path).unwrap();
