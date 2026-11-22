@@ -20,9 +20,18 @@ fn unavailable_wsl_host_still_allows_a_safe_dry_run() {
         fs::create_dir_all(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let cache = home.join(".cache/yarn");
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&scan_root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(scan_root.join(".gitignore"), b"/.turbo/\n").unwrap();
+    fs::write(scan_root.join("package.json"), b"{\"private\":true}\n").unwrap();
+    let cache = scan_root.join(".turbo");
     fs::create_dir_all(&cache).unwrap();
-    fs::set_permissions(home.join(".cache"), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
     let marker = cache.join("regenerable");
     fs::write(&marker, b"synthetic").unwrap();
